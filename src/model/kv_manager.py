@@ -1,0 +1,284 @@
+import math
+
+import torch
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Union, Optional, Set
+
+
+@dataclass
+class RequestInfo:
+    block_ids: List[int] = field(default_factory=list)
+    sequence_length:int = field(default_factory=int)
+    reserved_position: Optional[int] = None
+    reserved_block_id: Optional[int] = None
+    reserved_block_offset: Optional[int] = None
+    written_layer_ids: Set[int] = field(default_factory=set)
+
+class KVCacheManager:
+    def __init__(self, block_size, total_memory, tensor_dtype, device,
+                 num_layers, num_kv_heads, head_dim):
+        self.block_size = block_size
+        self.total_memory = total_memory
+        self.tensor_dtype = tensor_dtype
+        self.device = device
+
+        # 2 × layers × KV heads × block size × head dimension × bytes per element
+        bytes_per_element = torch.empty(0, dtype=self.tensor_dtype).element_size()
+        self.bytes_per_block = 2 * num_layers * num_kv_heads * block_size * head_dim * bytes_per_element
+        self.total_available_blocks = self.total_memory // self.bytes_per_block
+
+        if self.total_available_blocks == 0:
+            raise ValueError(
+                f"Memory budget is too small; one block requires {self.bytes_per_block} bytes"
+            )
+
+        self.free_blocks = list(range(self.total_available_blocks))
+
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+
+
+        # "heads, tokens, head_dim" divided in blocks for each layer?
+        pool_shape = (
+            self.num_layers,
+            self.total_available_blocks,
+            self.num_kv_heads,
+            self.block_size,
+            self.head_dim
+        )
+
+        self.key_pool = torch.empty(pool_shape, dtype=self.tensor_dtype, device=self.device)
+        self.value_pool = torch.empty(pool_shape, dtype=self.tensor_dtype, device=self.device)
+
+        self.requests = defaultdict(RequestInfo)
+
+    def allocate_block(self):
+        if not self.free_blocks:
+            raise RuntimeError("KV cache full")
+        return self.free_blocks.pop()
+
+    def free_block(self, block_id):
+        self.free_blocks.append(block_id)
+
+    def reserve_token_slot(self, request_id):
+        request_info = self.requests[request_id]
+        if request_info.reserved_position is not None:
+            raise RuntimeError("the previous token was not committed")
+
+        if request_info.written_layer_ids:
+            raise RuntimeError("Written layers is not empty")
+
+        sequence_length = request_info.sequence_length
+        logical_block = sequence_length // self.block_size
+        block_offset = sequence_length % self.block_size
+
+        if block_offset == 0:
+            block_id = self.allocate_block()
+            request_info.block_ids.append(block_id)
+
+        else:
+            block_id = request_info.block_ids[logical_block]
+
+        request_info.reserved_position = sequence_length
+        request_info.reserved_block_id = block_id
+        request_info.reserved_block_offset = block_offset
+        return request_info.reserved_position, request_info.reserved_block_id, request_info.reserved_block_offset
+
+
+    def write_layer_kv(self, request_id, layer_id, new_key, new_value):
+        assert new_key.shape == (self.num_kv_heads, self.head_dim)
+        assert new_value.shape == (self.num_kv_heads, self.head_dim)
+        assert 0 <= layer_id <= self.num_layers - 1
+
+        request_info = self.requests[request_id]
+        self._write_reserved_layer(request_info, layer_id, new_key, new_value)
+
+    def _write_reserved_layer(self, request_info, layer_id, new_key, new_value):
+        if request_info.reserved_position is None:
+            raise RuntimeError("No token slot is reserved")
+
+        if layer_id in request_info.written_layer_ids:
+            raise RuntimeError("Duplicate layer write")
+
+        reserved_block_id = request_info.reserved_block_id
+        reserved_block_offset = request_info.reserved_block_offset
+
+        self.key_pool[layer_id, reserved_block_id, :, reserved_block_offset, :] = new_key
+        self.value_pool[layer_id, reserved_block_id, :, reserved_block_offset, :] = new_value
+        request_info.written_layer_ids.add(layer_id)
+
+
+    def is_layer_written(self, request_id, layer_id):
+        return layer_id in self.requests[request_id].written_layer_ids
+
+    def commit_token(self, request_id):
+        request_info = self.requests[request_id]
+        if request_info.reserved_position is None:
+            raise RuntimeError("No token slot is reserved.")
+
+        if request_info.reserved_position != request_info.sequence_length:
+            raise RuntimeError("Reserved position is not matching sequence length")
+
+        for layer in range(self.num_layers):
+            if layer not in request_info.written_layer_ids:
+                raise RuntimeError("Layer not written")
+
+        request_info.sequence_length += 1
+        request_info.reserved_position = None
+        request_info.reserved_block_id = None
+        request_info.reserved_block_offset = None
+        request_info.written_layer_ids.clear()
+
+    def store_prefill_request(self, request_id, layer_kv_cache):
+        if request_id in self.requests and self.requests[request_id].sequence_length != 0:
+            raise RuntimeError("Prefill can only be stored for a new request")
+        if len(layer_kv_cache) != self.num_layers:
+            raise ValueError("Prefill cache does not contain every model layer")
+
+        number_of_prompt_token = layer_kv_cache[0][0].shape[1]
+        if number_of_prompt_token == 0:
+            raise ValueError("A prefill cache cannot be empty")
+
+        expected_shape = (
+            self.num_kv_heads,
+            number_of_prompt_token,
+            self.head_dim,
+        )
+        for layer_key_cache, layer_value_cache in layer_kv_cache:
+            if layer_key_cache.shape != expected_shape:
+                raise ValueError("Unexpected prefill key-cache shape")
+            if layer_value_cache.shape != expected_shape:
+                raise ValueError("Unexpected prefill value-cache shape")
+
+        for token_index in range(number_of_prompt_token):
+            self.reserve_token_slot(request_id)
+            for layer_id in range(self.num_layers):
+
+                layer_key_cache = layer_kv_cache[layer_id][0]
+                layer_value_cache = layer_kv_cache[layer_id][1]
+
+                new_key = layer_key_cache[:, token_index, :]
+                new_value = layer_value_cache[:, token_index, :]
+
+                self._write_reserved_layer(
+                    self.requests[request_id],
+                    layer_id,
+                    new_key,
+                    new_value,
+                )
+
+            self.commit_token(request_id)
+
+    def store_prefill(self, request_id, kv_cache, batch_index=0):
+        request_cache = []
+        for layer_key_cache, layer_value_cache in kv_cache:
+            if not 0 <= batch_index < layer_key_cache.shape[0]:
+                raise IndexError("batch_index is outside the prefill cache batch")
+            request_cache.append(
+                (
+                    layer_key_cache[batch_index],
+                    layer_value_cache[batch_index],
+                )
+            )
+
+        self.store_prefill_request(request_id, request_cache)
+
+
+    def get_context_metadata(self, request_id):
+        request_info = self.requests[request_id]
+        if request_info.reserved_position is None:
+            raise RuntimeError("No token slot is reserved")
+
+        context_length = request_info.sequence_length + 1
+        num_logical_block = math.ceil(context_length / self.block_size)
+
+        physical_blocks = []
+        valid_token_size = []
+        for i in range(num_logical_block):
+            block_start = i * self.block_size
+            block = request_info.block_ids[i]
+            physical_blocks.append(block)
+            valid_token_size.append(min(self.block_size, context_length-block_start))
+
+        return physical_blocks, valid_token_size, context_length
+
+
+    def write_layer_kv_batch(self, request_ids, layer_id, new_keys, new_values):
+        if not request_ids:
+            return
+        if len(request_ids) != len(set(request_ids)):
+            raise ValueError("request_ids must be unique")
+        if not 0 <= layer_id < self.num_layers:
+            raise ValueError("Invalid layer_id")
+
+        expected_shape = (len(request_ids), self.num_kv_heads, self.head_dim)
+        if new_keys.shape != expected_shape or new_values.shape != expected_shape:
+            raise ValueError("Unexpected batched K/V shape")
+
+        block_ids = []
+        block_offsets = []
+        for request_id in request_ids:
+            request_info = self.requests[request_id]
+            if request_info.reserved_position is None:
+                raise RuntimeError(f"Request {request_id} has no reserved token slot")
+            if layer_id in request_info.written_layer_ids:
+                raise RuntimeError(f"Request {request_id} already wrote layer {layer_id}")
+            block_ids.append(request_info.reserved_block_id)
+            block_offsets.append(request_info.reserved_block_offset)
+
+        block_ids = torch.tensor(block_ids, dtype=torch.long, device=self.key_pool.device)
+        block_offsets = torch.tensor(block_offsets, dtype=torch.long, device=self.key_pool.device)
+
+        self.key_pool[layer_id, block_ids, :, block_offsets, :] = new_keys # [batch_size, heads, head_dim]
+        self.value_pool[layer_id, block_ids, :, block_offsets, :] = new_values # [batch_size, heads, head_dim]
+
+        for request_id in request_ids:
+            self.requests[request_id].written_layer_ids.add(layer_id)
+
+
+    def free_request(self, request_id):
+        if request_id not in self.requests:
+            raise RuntimeError("Request id not found")
+
+        request_info = self.requests[request_id]
+        if request_info.reserved_position is not None:
+            raise RuntimeError("Token slot is reserved")
+
+        if len(request_info.written_layer_ids) > 0:
+            raise RuntimeError("Written layers are not empty")
+
+        if len(request_info.block_ids) != len(set(request_info.block_ids)):
+            raise RuntimeError("Request contains duplicate block IDs")
+
+        for block_id in request_info.block_ids:
+            self.free_block(block_id)
+
+        del self.requests[request_id]
+
+
+    def gather_layer(self, request_id, layer_id):
+        request_info = self.requests[request_id]
+        block_ids = request_info.block_ids
+
+        layer_key = self.key_pool[layer_id, block_ids, :, :, :]
+        layer_value = self.value_pool[layer_id, block_ids, :, :, :]
+
+        # Move kv_heads before the blocks:
+        # before: block_id, kv head, block_size, embedding_dim
+        # after: kv head, block_id, block_size, embedding_dim
+        layer_key = layer_key.permute(1, 0, 2, 3)
+        layer_value = layer_value.permute(1, 0, 2, 3)
+
+        # combine block_id, block_size
+        layer_key = layer_key.reshape(self.num_kv_heads, -1, self.head_dim)
+        layer_value = layer_value.reshape(self.num_kv_heads, -1, self.head_dim)
+
+        layer_key = layer_key[:, :request_info.sequence_length, :]
+        layer_value = layer_value[:, :request_info.sequence_length, :]
+
+        layer_key = layer_key.unsqueeze(0)
+        layer_value = layer_value.unsqueeze(0)
+
+        return layer_key, layer_value
