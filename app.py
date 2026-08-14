@@ -3,24 +3,24 @@ from time import perf_counter
 
 import streamlit as st
 
-from main import build_demo_scheduler
+from main import build_scheduler
 
 
-st.set_page_config(page_title="LLM Serving Lab", page_icon="🧪")
+st.set_page_config(page_title="PagedServe", page_icon="⚙️")
 
 
 @st.cache_resource
 def get_runtime():
-    return build_demo_scheduler(), Lock()
+    return build_scheduler(), Lock()
 
 
 scheduler, scheduler_lock = get_runtime()
 
-st.title("LLM Serving Lab")
-st.caption("Orca-style scheduling with a paged KV cache")
+st.title("PagedServe")
+st.caption("Continuous-batching LLM inference with a paged KV cache")
 st.info(
-    "The Transformer has random weights. This demo is for observing the "
-    "inference pipeline, so generated text will not be meaningful."
+    "The included reference model uses locally initialized weights to exercise "
+    "the complete serving pipeline; its generated text is not semantically trained output."
 )
 
 with st.form("generation-form"):

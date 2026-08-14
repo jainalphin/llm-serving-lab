@@ -7,7 +7,7 @@ from src.model.tokenizer import ByteTokenizer
 from src.scheduler.orca_scheduler import ContinuousBatchScheduler
 
 
-def build_demo_scheduler():
+def build_scheduler():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = ByteTokenizer()
     config = TransformerConfig(
@@ -42,7 +42,7 @@ def build_demo_scheduler():
 
 
 def main():
-    scheduler = build_demo_scheduler()
+    scheduler = build_scheduler()
     first_request = scheduler.add_request("Paged attention", max_new_tokens=8)
     second_request = scheduler.add_request("Orca", max_new_tokens=8)
     results = scheduler.run_until_complete()
