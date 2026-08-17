@@ -132,8 +132,20 @@ class KVCacheManager:
         request_info.written_layer_ids.clear()
 
     def store_prefill_request(self, request_id, layer_kv_cache):
-        if request_id in self.requests and self.requests[request_id].sequence_length != 0:
-            raise RuntimeError("Prefill can only be stored for a new request")
+        self.append_prefill_chunk(request_id, layer_kv_cache, start_position=0)
+
+    def append_prefill_chunk(self, request_id, layer_kv_cache, start_position):
+        if start_position < 0:
+            raise ValueError("Prefill start position cannot be negative")
+        if request_id in self.requests:
+            request_info = self.requests[request_id]
+            if request_info.sequence_length != start_position:
+                raise RuntimeError("Prefill chunk does not continue the cached sequence")
+            if request_info.reserved_position is not None:
+                raise RuntimeError("Cannot append a prefill chunk with a reserved token")
+        elif start_position != 0:
+            raise RuntimeError("The first prefill chunk must start at position zero")
+
         if len(layer_kv_cache) != self.num_layers:
             raise ValueError("Prefill cache does not contain every model layer")
 

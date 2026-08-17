@@ -1,137 +1,136 @@
 # PagedServe
 
-**A continuous-batching LLM inference engine built with PyTorch.**
+A PyTorch LLM inference engine with continuous batching and a paged KV cache.
 
-PagedServe implements the core systems behind modern language-model serving: iteration-level scheduling, mixed prefill and decode batches, paged KV-cache management, and autoregressive decoding. Its modular runtime is designed to support different decoder-only model configurations while keeping scheduling, memory management, attention, and tokenization as independent components.
+PagedServe combines new prompts and active generation requests in each model iteration. The KV cache is stored in reusable fixed-size blocks, reducing wasted memory and allowing completed requests to release memory immediately.
 
-## Highlights
+## Supported models
 
-- **Continuous batching:** combines newly arrived prompts and active decode requests in the same model iteration.
-- **Orca-style scheduling:** schedules work at iteration granularity instead of waiting for an entire static batch to finish.
-- **Paged KV cache:** stores keys and values in fixed-size physical blocks and maps them to per-request logical block tables.
-- **Memory-aware admission:** reserves cache capacity before admitting requests and releases blocks as soon as generation completes.
-- **Unified prefill and decode path:** flattens mixed request phases into a single iteration batch while preserving request boundaries.
-- **Configurable model runtime:** supports decoder depth, width, attention heads, context length, vocabulary, and device selection through `TransformerConfig`.
-- **End-to-end interface:** includes a Streamlit application for submitting prompts and inspecting generated tokens and latency.
-- **Correctness coverage:** tests scheduling, cache allocation, paged attention, prefill/decode parity, and request lifecycle behavior.
+| Model | Weights | Tokenizer |
+| --- | --- | --- |
+| Reference Transformer | Locally initialized | UTF-8 byte tokenizer |
+| DistilGPT-2 | `distilbert/distilgpt2` | Hugging Face GPT-2 tokenizer |
+| GPT-2 | `openai-community/gpt2` | Hugging Face GPT-2 tokenizer |
 
-## Architecture
 
-```text
-Client requests
-      │
-      ▼
-ContinuousBatchScheduler
-  ├── waiting queue
-  ├── active requests
-  └── memory-aware admission
-      │
-      ▼
-IterationBatch
-  ├── mixed prefill/decode tokens
-  ├── request offsets
-  └── position IDs
-      │
-      ▼
-PagedDecoderLM ───────► PagedAttention
-      │                       │
-      └───────────────────────▼
-                       KVCacheManager
-                    logical block tables
-                    + physical K/V pools
-```
+## Installation
 
-The runtime separates request orchestration from model execution. The scheduler only depends on a model engine that exposes configuration and iteration-level inference, making the serving path extensible to additional decoder-only model implementations and tokenizers.
-
-## How an iteration works
-
-1. A request enters the scheduler through `ContinuousBatchScheduler.add_request()`.
-2. The tokenizer converts its prompt into token IDs and places it in the waiting queue.
-3. The scheduler selects requests in first-come, first-served order, subject to batch size and KV-cache capacity.
-4. Prefill tokens from new requests and one decode token from each active request are flattened into a single `IterationBatch`.
-5. The model processes the batch once, while attention uses request offsets to preserve independent causal contexts.
-6. One next-token result is selected for every request in the iteration.
-7. Completed requests immediately release their KV-cache blocks; unfinished requests remain active for the next step.
-
-For example, a decode request and a new prompt can share one iteration:
-
-```text
-Request A: decode  [75]
-Request B: prefill [10, 20, 30]
-
-flat_input_ids    = [75, 10, 20, 30]
-flat_position_ids = [ 5,  0,  1,  2]
-
-A owns offsets [0:1]
-B owns offsets [1:4]
-```
-
-## Paged KV-cache design
-
-Key and value tensors are allocated from fixed-size pools with the layout:
-
-```text
-[layer, physical_block, KV_head, token_offset, head_dimension]
-```
-
-Each request maintains a logical block table containing its physical block IDs.
-
-- During **prefill**, causal attention processes the prompt and writes every layer's K/V tensors into allocated cache blocks.
-- During **decode**, the manager reserves one token location, each layer writes its K/V state, and the token is committed only after all layer writes succeed.
-- When a request finishes, its physical blocks return to the free list for immediate reuse.
-
-## Quick start
+PagedServe requires Python 3.12.
 
 ```bash
-git clone <repository-url> pagedserve
+git clone https://github.com/jainalphin/pagedserve.git
 cd pagedserve
 ./env.sh
 source .venv/bin/activate
 ```
 
-The setup script creates a Python 3.12 virtual environment and installs the dependencies from `requirements.txt`. PagedServe automatically uses CUDA when it is available and otherwise runs on CPU.
+The first run of each pretrained model downloads and caches its weights from Hugging Face. CUDA is used automatically when available; otherwise, the model runs on CPU.
 
-## Run the interface
+## Run the web interface
 
 ```bash
 PYTHONPATH=. python -m streamlit run app.py
 ```
 
-The interface accepts a prompt and generation length, then displays the request ID, generated token IDs, output text, and end-to-end latency.
+Select either **Reference Transformer** or **GPT-2 (pretrained)** in the interface.
 
-## Run the engine directly
+## Run from the command line
+
+Reference Transformer:
 
 ```bash
 PYTHONPATH=. python main.py
 ```
 
-## Run the tests
+GPT-2:
 
 ```bash
-PYTHONPATH=. python -m pytest -q -p no:cacheprovider testing/test_project.py
+PYTHONPATH=. python main.py --model gpt2
 ```
 
-## Project structure
+DistilGPT-2:
 
-```text
-pagedserve/
-├── app.py                         # Streamlit interface
-├── main.py                        # Runtime assembly and CLI example
-├── src/
-│   ├── model/
-│   │   ├── iteration.py           # Mixed-phase iteration metadata
-│   │   ├── kv_manager.py          # Paged KV-cache allocator
-│   │   ├── paged_attention.py     # Cache-aware attention
-│   │   ├── paged_decoder.py       # Configurable decoder-only model
-│   │   └── tokenizer.py           # Tokenizer interface
-│   └── scheduler/
-│       └── orca_scheduler.py      # Continuous batch scheduler
-└── testing/
-    └── test_project.py            # Runtime and correctness tests
+```bash
+PYTHONPATH=. python main.py --model distilgpt2
 ```
 
-## Current scope
+## Scheduling strategies
 
-PagedServe currently ships with a compact, locally initialized decoder-only Transformer that exercises the complete serving path without requiring external model weights. The runtime focuses on inference-system correctness and component boundaries; generated text from the included model is not semantically trained output.
+Orca-style iteration scheduling is the default. A simplified Sarathi-style strategy is also available:
 
-The next engineering milestones are pretrained model adapters, Hugging Face tokenizer integration, configurable sampling, optimized Triton/CUDA attention kernels, asynchronous request handling, and multi-device execution.
+```bash
+PYTHONPATH=. python main.py \
+  --model distilgpt2 \
+  --strategy sarathi \
+  --prefill-chunk-size 128
+```
+
+The Sarathi strategy admits at most one prompt chunk per iteration and fills the remaining request slots with active decodes. Later chunks attend to earlier chunks through the paged KV cache, and the scheduler emits the first generated token only after the final prompt chunk. This follows the chunked-prefill and decode-maximal batching policy from [Sarathi-Serve](https://www.usenix.org/conference/osdi24/presentation/agrawal).
+
+This is a single-device educational implementation, not the complete optimized Sarathi-Serve runtime. Chunking is intended to bound interruptions to active decodes when long prompts arrive; it can increase prompt TTFT and reduce closed-batch throughput, especially on CPU.
+
+## Run in Notebook
+
+Install the project in a notebook cell:
+
+```python
+!git clone https://github.com/jainalphin/pagedserve.git
+%cd pagedserve
+%pip install -r requirements.txt
+```
+
+Restart the notebook kernel after installation, then run GPT-2:
+
+```python
+from main import GPT2_MODEL, build_scheduler
+
+scheduler = build_scheduler(GPT2_MODEL)
+request_id = scheduler.add_request(
+    "Once upon a time",
+    max_new_tokens=30,
+)
+
+results = scheduler.run_until_complete()
+print(results[request_id])
+```
+
+Multiple requests can be processed with continuous batching:
+
+```python
+first = scheduler.add_request("Artificial intelligence is", max_new_tokens=20)
+second = scheduler.add_request("The future of computing", max_new_tokens=20)
+
+results = scheduler.run_until_complete()
+print(results[first])
+print(results[second])
+```
+
+## Run benchmarks
+
+Benchmark every supported model:
+
+```bash
+PYTHONPATH=. python benchmark.py
+```
+
+Benchmark one model with custom settings:
+
+```bash
+PYTHONPATH=. python benchmark.py --model gpt2 --batch-size 4 --max-new-tokens 32 --runs 5
+```
+
+Compare both schedulers, or measure prefill-induced decode stalls:
+
+```bash
+PYTHONPATH=. python benchmark.py \
+  --model distilgpt2 \
+  --strategy orca \
+  --strategy sarathi \
+  --prefill-chunk-size 128
+
+PYTHONPATH=. python strategy_benchmark.py --model distilgpt2
+```
+
+The script reports model and system metadata, loading time, median and p95 generation latency, time to first token, token throughput, exact token counts, and peak CUDA memory. Pass `--json-output PATH` to retain every raw run. New entries in `SUPPORTED_MODELS` are benchmarked automatically.
+
+See [BENCHMARKS.md](BENCHMARKS.md) for measured Apple M4 CPU results for all included models and the exact reproduction command.

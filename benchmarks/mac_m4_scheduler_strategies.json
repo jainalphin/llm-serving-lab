@@ -1,0 +1,215 @@
+{
+  "system": {
+    "timestamp_utc": "2026-08-17T14:46:29.939783+00:00",
+    "platform": "macOS-15.7.7-arm64-arm-64bit",
+    "machine": "arm64",
+    "python_version": "3.12.13",
+    "pytorch_version": "2.13.0",
+    "logical_cpu_count": 10,
+    "pytorch_intraop_threads": 4,
+    "pytorch_interop_threads": 10,
+    "cuda_available": false,
+    "mps_built": true,
+    "mps_available": false
+  },
+  "settings": {
+    "models": [
+      "distilgpt2"
+    ],
+    "strategies": [
+      "orca",
+      "sarathi"
+    ],
+    "prompt": "Paged attention stores key and value tensors in reusable blocks while continuous batching combines active decode requests with newly arriving prompts. Chunked prefill divides long prompts into smaller pieces so decode requests can continue making progress without waiting behind one large prefill operation. Decode maximal batching then combines one prefill chunk with as many active decode tokens as the batch can hold.",
+    "batch_size": 4,
+    "max_new_tokens": 16,
+    "warmup_runs": 3,
+    "measured_runs": 10,
+    "seed": 1234,
+    "prefill_chunk_size": 16
+  },
+  "results": [
+    {
+      "model": "distilgpt2",
+      "strategy": "orca",
+      "prefill_chunk_size": null,
+      "device": "cpu",
+      "parameter_count": 81912576,
+      "prompt_tokens": 75,
+      "load_seconds": 4.97300991602242,
+      "latency_seconds": {
+        "mean": 0.41504860398126764,
+        "median": 0.40772383305011317,
+        "p95": 0.46600393299595455,
+        "minimum": 0.3803609579335898,
+        "maximum": 0.4765517079504207,
+        "standard_deviation": 0.028997528754552387
+      },
+      "first_token_seconds": {
+        "mean": 0.059758591605350374,
+        "median": 0.05827058298746124,
+        "p95": 0.07393017297727057,
+        "minimum": 0.05217241705395281,
+        "maximum": 0.08222354203462601,
+        "standard_deviation": 0.008893564944089894
+      },
+      "aggregate_tokens_per_second": 154.1988080096964,
+      "total_generated_tokens": 640,
+      "expected_generated_tokens": 640,
+      "peak_gpu_memory_mb": null,
+      "raw_runs": [
+        {
+          "latency_seconds": 0.4193352919537574,
+          "first_token_seconds": 0.05523566692136228,
+          "generated_tokens": 64,
+          "tokens_per_second": 152.6224985781966
+        },
+        {
+          "latency_seconds": 0.453112208051607,
+          "first_token_seconds": 0.06379383301828057,
+          "generated_tokens": 64,
+          "tokens_per_second": 141.24536673863076
+        },
+        {
+          "latency_seconds": 0.4765517079504207,
+          "first_token_seconds": 0.08222354203462601,
+          "generated_tokens": 64,
+          "tokens_per_second": 134.29812323043527
+        },
+        {
+          "latency_seconds": 0.40973379102069885,
+          "first_token_seconds": 0.05770929099526256,
+          "generated_tokens": 64,
+          "tokens_per_second": 156.19897944118273
+        },
+        {
+          "latency_seconds": 0.4023846669588238,
+          "first_token_seconds": 0.06213533296249807,
+          "generated_tokens": 64,
+          "tokens_per_second": 159.0517861520532
+        },
+        {
+          "latency_seconds": 0.3803609579335898,
+          "first_token_seconds": 0.05276024993509054,
+          "generated_tokens": 64,
+          "tokens_per_second": 168.26122309633644
+        },
+        {
+          "latency_seconds": 0.39049870800226927,
+          "first_token_seconds": 0.05217241705395281,
+          "generated_tokens": 64,
+          "tokens_per_second": 163.89298783449004
+        },
+        {
+          "latency_seconds": 0.3998213749146089,
+          "first_token_seconds": 0.058831874979659915,
+          "generated_tokens": 64,
+          "tokens_per_second": 160.0714819553324
+        },
+        {
+          "latency_seconds": 0.4057138750795275,
+          "first_token_seconds": 0.05248012510128319,
+          "generated_tokens": 64,
+          "tokens_per_second": 157.7466385330174
+        },
+        {
+          "latency_seconds": 0.4129734579473734,
+          "first_token_seconds": 0.0602435830514878,
+          "generated_tokens": 64,
+          "tokens_per_second": 154.97363999638867
+        }
+      ]
+    },
+    {
+      "model": "distilgpt2",
+      "strategy": "sarathi",
+      "prefill_chunk_size": 16,
+      "device": "cpu",
+      "parameter_count": 81912576,
+      "prompt_tokens": 75,
+      "load_seconds": 0.606039666919969,
+      "latency_seconds": {
+        "mean": 0.6272122708149255,
+        "median": 0.6207293750485405,
+        "p95": 0.6650152900605463,
+        "minimum": 0.6072777080116794,
+        "maximum": 0.6843403339153156,
+        "standard_deviation": 0.023786864915016918
+      },
+      "first_token_seconds": {
+        "mean": 0.07570840831613168,
+        "median": 0.07262649945914745,
+        "p95": 0.08644173970096744,
+        "minimum": 0.0706642500590533,
+        "maximum": 0.08707595802843571,
+        "standard_deviation": 0.006175296599050021
+      },
+      "aggregate_tokens_per_second": 102.03881999445893,
+      "total_generated_tokens": 640,
+      "expected_generated_tokens": 640,
+      "peak_gpu_memory_mb": null,
+      "raw_runs": [
+        {
+          "latency_seconds": 0.6843403339153156,
+          "first_token_seconds": 0.08566658396739513,
+          "generated_tokens": 64,
+          "tokens_per_second": 93.52071889996148
+        },
+        {
+          "latency_seconds": 0.6365907080471516,
+          "first_token_seconds": 0.07939683308359236,
+          "generated_tokens": 64,
+          "tokens_per_second": 100.53555477793684
+        },
+        {
+          "latency_seconds": 0.6315619159722701,
+          "first_token_seconds": 0.07246804097667336,
+          "generated_tokens": 64,
+          "tokens_per_second": 101.33606599991701
+        },
+        {
+          "latency_seconds": 0.6288444170495495,
+          "first_token_seconds": 0.07480354211293161,
+          "generated_tokens": 64,
+          "tokens_per_second": 101.7739813931705
+        },
+        {
+          "latency_seconds": 0.6105247080558911,
+          "first_token_seconds": 0.07088283298071474,
+          "generated_tokens": 64,
+          "tokens_per_second": 104.82786225605312
+        },
+        {
+          "latency_seconds": 0.6413957920158282,
+          "first_token_seconds": 0.08707595802843571,
+          "generated_tokens": 64,
+          "tokens_per_second": 99.78238210583805
+        },
+        {
+          "latency_seconds": 0.6126143330475315,
+          "first_token_seconds": 0.0706642500590533,
+          "generated_tokens": 64,
+          "tokens_per_second": 104.4702948454103
+        },
+        {
+          "latency_seconds": 0.6100492499535903,
+          "first_token_seconds": 0.07278495794162154,
+          "generated_tokens": 64,
+          "tokens_per_second": 104.90956263755561
+        },
+        {
+          "latency_seconds": 0.6089235420804471,
+          "first_token_seconds": 0.07175391702912748,
+          "generated_tokens": 64,
+          "tokens_per_second": 105.1035073817933
+        },
+        {
+          "latency_seconds": 0.6072777080116794,
+          "first_token_seconds": 0.07158716698177159,
+          "generated_tokens": 64,
+          "tokens_per_second": 105.38835718101006
+        }
+      ]
+    }
+  ]
+}

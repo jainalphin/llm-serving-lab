@@ -1,0 +1,275 @@
+{
+  "system": {
+    "timestamp_utc": "2026-08-17T14:46:55.416658+00:00",
+    "platform": "macOS-15.7.7-arm64-arm-64bit",
+    "machine": "arm64",
+    "python_version": "3.12.13",
+    "pytorch_version": "2.13.0",
+    "logical_cpu_count": 10,
+    "pytorch_intraop_threads": 4,
+    "pytorch_interop_threads": 10,
+    "cuda_available": false,
+    "mps_built": true,
+    "mps_available": false
+  },
+  "settings": {
+    "model": "distilgpt2",
+    "active_decodes": 3,
+    "prefill_chunk_size": 128,
+    "long_prompt_repetitions": 7,
+    "warmup_runs": 2,
+    "measured_runs": 10
+  },
+  "results": [
+    {
+      "model": "distilgpt2",
+      "strategy": "orca",
+      "device": "cpu",
+      "prompt_tokens": 526,
+      "prefill_chunk_size": null,
+      "long_prompt_ttft_seconds": {
+        "mean": 0.10927057478111238,
+        "median": 0.10862841649213806,
+        "p95": 0.11525226214434951,
+        "minimum": 0.10363308293744922,
+        "maximum": 0.11564987490419298,
+        "standard_deviation": 0.00396639010346773
+      },
+      "maximum_decode_stall_seconds": {
+        "mean": 0.10926848779199645,
+        "median": 0.10862639604602009,
+        "p95": 0.11524987340089865,
+        "minimum": 0.10363124997820705,
+        "maximum": 0.1156475420575589,
+        "standard_deviation": 0.003966306487081972
+      },
+      "raw_runs": [
+        {
+          "long_prompt_ttft_seconds": 0.11045720800757408,
+          "maximum_decode_stall_seconds": 0.11045545898377895,
+          "prefill_iterations": 1,
+          "iteration_seconds": [
+            0.11045545898377895
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.10363308293744922,
+          "maximum_decode_stall_seconds": 0.10363124997820705,
+          "prefill_iterations": 1,
+          "iteration_seconds": [
+            0.10363124997820705
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.11178270808886737,
+          "maximum_decode_stall_seconds": 0.11178108397871256,
+          "prefill_iterations": 1,
+          "iteration_seconds": [
+            0.11178108397871256
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.11564987490419298,
+          "maximum_decode_stall_seconds": 0.1156475420575589,
+          "prefill_iterations": 1,
+          "iteration_seconds": [
+            0.1156475420575589
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.1077615829417482,
+          "maximum_decode_stall_seconds": 0.10775954194832593,
+          "prefill_iterations": 1,
+          "iteration_seconds": [
+            0.10775954194832593
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.10935479099862278,
+          "maximum_decode_stall_seconds": 0.10935241705738008,
+          "prefill_iterations": 1,
+          "iteration_seconds": [
+            0.10935241705738008
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.10790204198565334,
+          "maximum_decode_stall_seconds": 0.1079003750346601,
+          "prefill_iterations": 1,
+          "iteration_seconds": [
+            0.1079003750346601
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.11476629099342972,
+          "maximum_decode_stall_seconds": 0.11476383393164724,
+          "prefill_iterations": 1,
+          "iteration_seconds": [
+            0.11476383393164724
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.1048262920230627,
+          "maximum_decode_stall_seconds": 0.1048244999255985,
+          "prefill_iterations": 1,
+          "iteration_seconds": [
+            0.1048244999255985
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.10657187493052334,
+          "maximum_decode_stall_seconds": 0.10656887502409518,
+          "prefill_iterations": 1,
+          "iteration_seconds": [
+            0.10656887502409518
+          ]
+        }
+      ]
+    },
+    {
+      "model": "distilgpt2",
+      "strategy": "sarathi",
+      "device": "cpu",
+      "prompt_tokens": 526,
+      "prefill_chunk_size": 128,
+      "long_prompt_ttft_seconds": {
+        "mean": 0.19704430000856518,
+        "median": 0.18089072953443974,
+        "p95": 0.27368004722520717,
+        "minimum": 0.17123187496326864,
+        "maximum": 0.3343620409723371,
+        "standard_deviation": 0.048960340683414434
+      },
+      "maximum_decode_stall_seconds": {
+        "mean": 0.04968916238285601,
+        "median": 0.04376552044413984,
+        "p95": 0.08029899781686257,
+        "minimum": 0.04041954199783504,
+        "maximum": 0.10488829202950001,
+        "standard_deviation": 0.019607526507588752
+      },
+      "raw_runs": [
+        {
+          "long_prompt_ttft_seconds": 0.19951316597871482,
+          "maximum_decode_stall_seconds": 0.045539416023530066,
+          "prefill_iterations": 5,
+          "iteration_seconds": [
+            0.04088541597593576,
+            0.0436826249351725,
+            0.04006129200570285,
+            0.045539416023530066,
+            0.029325832962058485
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.1776582080638036,
+          "maximum_decode_stall_seconds": 0.04143833299167454,
+          "prefill_iterations": 5,
+          "iteration_seconds": [
+            0.03484400000888854,
+            0.03739612502977252,
+            0.038543625036254525,
+            0.04143833299167454,
+            0.025421124999411404
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.17165616701822728,
+          "maximum_decode_stall_seconds": 0.04110699996817857,
+          "prefill_iterations": 5,
+          "iteration_seconds": [
+            0.031198124983347952,
+            0.03494174999650568,
+            0.03982191707473248,
+            0.04110699996817857,
+            0.02457337500527501
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.17906424996908754,
+          "maximum_decode_stall_seconds": 0.041415291954763234,
+          "prefill_iterations": 5,
+          "iteration_seconds": [
+            0.03919674991630018,
+            0.035516415955498815,
+            0.037143541034311056,
+            0.041415291954763234,
+            0.025778208975680172
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.18079975002910942,
+          "maximum_decode_stall_seconds": 0.044193332898430526,
+          "prefill_iterations": 5,
+          "iteration_seconds": [
+            0.03462037490680814,
+            0.03508475003764033,
+            0.0381025419337675,
+            0.044193332898430526,
+            0.028780708089470863
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.18684716697316617,
+          "maximum_decode_stall_seconds": 0.04333770798984915,
+          "prefill_iterations": 5,
+          "iteration_seconds": [
+            0.031930459081195295,
+            0.03638433292508125,
+            0.04011366597842425,
+            0.04333770798984915,
+            0.03506575000938028
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.3343620409723371,
+          "maximum_decode_stall_seconds": 0.10488829202950001,
+          "prefill_iterations": 5,
+          "iteration_seconds": [
+            0.0456764999544248,
+            0.06012858299072832,
+            0.05789091589394957,
+            0.06575929198879749,
+            0.10488829202950001
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.1883286670781672,
+          "maximum_decode_stall_seconds": 0.05024541600141674,
+          "prefill_iterations": 5,
+          "iteration_seconds": [
+            0.033387458068318665,
+            0.035995458951219916,
+            0.05024541600141674,
+            0.04306983307469636,
+            0.025614833110012114
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.17123187496326864,
+          "maximum_decode_stall_seconds": 0.04041954199783504,
+          "prefill_iterations": 5,
+          "iteration_seconds": [
+            0.032053958042524755,
+            0.03445591707713902,
+            0.038807541015557945,
+            0.04041954199783504,
+            0.025481499964371324
+          ]
+        },
+        {
+          "long_prompt_ttft_seconds": 0.18098170903977007,
+          "maximum_decode_stall_seconds": 0.044307291973382235,
+          "prefill_iterations": 5,
+          "iteration_seconds": [
+            0.03198054200038314,
+            0.03790120792109519,
+            0.044307291973382235,
+            0.04232208395842463,
+            0.02445704094134271
+          ]
+        }
+      ]
+    }
+  ]
+}

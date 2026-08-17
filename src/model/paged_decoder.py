@@ -21,6 +21,10 @@ class TransformerConfig:
     head_dim: int = field(default=16)
     mlp_hidden_size: int = field(default=256)
     max_sequence_length: int = field(default=128)
+    activation_function: str = field(default="gelu")
+    layer_norm_epsilon: float = field(default=1e-5)
+    tie_word_embeddings: bool = field(default=False)
+    lm_head_bias: bool = field(default=True)
 
 class PagedSelfAttention(nn.Module):
     def __init__(self, config: TransformerConfig):
@@ -118,8 +122,14 @@ class DecoderBlock(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.self_attn = PagedSelfAttention(self.config)
-        self.input_layernorm = nn.LayerNorm(config.hidden_size)
-        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size)
+        self.input_layernorm = nn.LayerNorm(
+            config.hidden_size,
+            eps=config.layer_norm_epsilon,
+        )
+        self.post_attention_layernorm = nn.LayerNorm(
+            config.hidden_size,
+            eps=config.layer_norm_epsilon,
+        )
         self.mlp_up_proj = nn.Linear(config.hidden_size, config.mlp_hidden_size)
         self.mlp_down_proj = nn.Linear(config.mlp_hidden_size, config.hidden_size)
 
@@ -129,7 +139,7 @@ class DecoderBlock(nn.Module):
         hidden_states = attn_output + attention_residual
         mlp_residual = hidden_states
         hidden_states = self.mlp_up_proj(self.post_attention_layernorm(hidden_states))
-        hidden_states = F.gelu(hidden_states)
+        hidden_states = self._activate(hidden_states)
         hidden_states = self.mlp_down_proj(hidden_states) + mlp_residual
         return hidden_states, key_states, value_states
 
@@ -144,7 +154,7 @@ class DecoderBlock(nn.Module):
         hidden_states = hidden_states + attention_residual
         mlp_residual = hidden_states
         hidden_states = self.mlp_up_proj(self.post_attention_layernorm(hidden_states))
-        hidden_states = F.gelu(hidden_states)
+        hidden_states = self._activate(hidden_states)
         hidden_states = self.mlp_down_proj(hidden_states) + mlp_residual
         return hidden_states
 
@@ -160,9 +170,18 @@ class DecoderBlock(nn.Module):
 
         mlp_residual = hidden_states
         hidden_states = self.mlp_up_proj(self.post_attention_layernorm(hidden_states))
-        hidden_states = F.gelu(hidden_states)
+        hidden_states = self._activate(hidden_states)
         hidden_states = self.mlp_down_proj(hidden_states) + mlp_residual
         return hidden_states, prefill_kv
+
+    def _activate(self, hidden_states):
+        if self.config.activation_function == "gelu":
+            return F.gelu(hidden_states)
+        if self.config.activation_function == "gelu_tanh":
+            return F.gelu(hidden_states, approximate="tanh")
+        raise ValueError(
+            f"Unsupported activation function: {self.config.activation_function}"
+        )
 
 
 
@@ -173,8 +192,17 @@ class PagedDecoderLM(nn.Module):
         self.embedding_table = nn.Embedding(config.vocab_size, config.hidden_size)
         self.position_embeddings = nn.Embedding(config.max_sequence_length, config.hidden_size)
         self.layers = nn.ModuleList([DecoderBlock(config, layer_id=layer_id) for layer_id in range(config.num_layers)])
-        self.final_layernorm = nn.LayerNorm(config.hidden_size)
-        self.output_layer = nn.Linear(config.hidden_size, config.vocab_size)
+        self.final_layernorm = nn.LayerNorm(
+            config.hidden_size,
+            eps=config.layer_norm_epsilon,
+        )
+        self.output_layer = nn.Linear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=config.lm_head_bias,
+        )
+        if config.tie_word_embeddings:
+            self.output_layer.weight = self.embedding_table.weight
 
     def embedding_helper(self, input_ids, position_ids):
         assert input_ids.size() == position_ids.size()
@@ -235,13 +263,18 @@ class PagedDecoderLM(nn.Module):
 
         for item in iteration_batch.items:
             if item.phase == "prefill":
-                expected_positions = tuple(range(item.token_count))
+                prefill_start = item.position_ids[0]
+                expected_positions = tuple(
+                    range(prefill_start, prefill_start + item.token_count)
+                )
                 if item.position_ids != expected_positions:
-                    raise ValueError("Prefill positions must start at zero and be contiguous")
+                    raise ValueError("Prefill positions must be contiguous")
                 if item.request_id in kv_manager.requests:
                     request_info = kv_manager.requests[item.request_id]
-                    if request_info.sequence_length != 0:
-                        raise RuntimeError("Cannot prefill an existing request")
+                    if request_info.sequence_length != prefill_start:
+                        raise RuntimeError("Prefill chunk does not match the KV-cache length")
+                elif prefill_start != 0:
+                    raise RuntimeError("The first prefill chunk must start at zero")
             else:
                 if item.request_id not in kv_manager.requests:
                     raise RuntimeError("Cannot decode an unknown request")
@@ -257,18 +290,29 @@ class PagedDecoderLM(nn.Module):
             for request_id, key_value in layer_prefill_kv.items():
                 prefill_cache[request_id].append(key_value)
 
-        logits = self.output_layer(self.final_layernorm(hidden_states))
+        output_items = [
+            item for item in iteration_batch.items if item.produces_output
+        ]
+        if output_items:
+            output_hidden_states = torch.stack(
+                [hidden_states[item.end_offset - 1] for item in output_items],
+                dim=0,
+            )
+            logits = self.output_layer(self.final_layernorm(output_hidden_states))
+        else:
+            logits = hidden_states.new_empty((0, self.config.vocab_size))
 
         for item in iteration_batch.items:
             if item.phase == "prefill":
-                kv_manager.store_prefill_request(item.request_id, prefill_cache[item.request_id])
+                kv_manager.append_prefill_chunk(
+                    item.request_id,
+                    prefill_cache[item.request_id],
+                    start_position=item.position_ids[0],
+                )
             else:
                 kv_manager.commit_token(item.request_id)
 
-        return torch.stack([logits[item.end_offset - 1] for item in iteration_batch.items], dim=0)
-
-
-
+        return logits
 
 
 

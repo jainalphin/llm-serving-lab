@@ -89,22 +89,37 @@ class PagedAttention:
 
         return torch.stack(outputs, dim=0)
 
-    def causal_prefill(self, queries, keys, values):
+    def causal_prefill(
+        self,
+        queries,
+        keys,
+        values,
+        past_keys=None,
+        past_values=None,
+    ):
         token_count = queries.shape[0]
         queries = queries.transpose(0, 1)
         keys = keys.transpose(0, 1)
         values = values.transpose(0, 1)
 
+        past_length = 0
+        if past_keys is not None or past_values is not None:
+            if past_keys is None or past_values is None:
+                raise ValueError("Past prefill keys and values must be provided together")
+            past_length = past_keys.shape[1]
+            keys = torch.cat((past_keys, keys), dim=1)
+            values = torch.cat((past_values, values), dim=1)
+
         scores = torch.matmul(queries, keys.transpose(-1, -2)) * self.scale
-        causal_mask = torch.triu(
-            torch.ones(
-                token_count,
-                token_count,
-                dtype=torch.bool,
-                device=scores.device,
-            ),
-            diagonal=1,
+        query_positions = past_length + torch.arange(
+            token_count,
+            device=scores.device,
         )
+        key_positions = torch.arange(
+            past_length + token_count,
+            device=scores.device,
+        )
+        causal_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
         scores = scores.masked_fill(causal_mask, float("-inf"))
         probabilities = torch.softmax(scores, dim=-1)
         return torch.matmul(probabilities, values).transpose(0, 1)
@@ -145,7 +160,22 @@ class PagedAttention:
             if item.phase == "prefill":
                 item_keys = keys[item_slice]
                 item_values = values[item_slice]
-                outputs[item_slice] = self.causal_prefill(item_queries, item_keys, item_values)
+                past_keys = None
+                past_values = None
+                if item.position_ids[0] > 0:
+                    past_keys, past_values = self.kv_manager.gather_layer(
+                        item.request_id,
+                        layer_id,
+                    )
+                    past_keys = past_keys.squeeze(0)
+                    past_values = past_values.squeeze(0)
+                outputs[item_slice] = self.causal_prefill(
+                    item_queries,
+                    item_keys,
+                    item_values,
+                    past_keys,
+                    past_values,
+                )
                 prefill_kv[item.request_id] = (item_keys.transpose(0, 1), item_values.transpose(0, 1))
             else:
                 outputs[item_slice] = self.forward(request_id=item.request_id,
