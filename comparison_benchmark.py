@@ -710,6 +710,16 @@ async def run_vllm(args, prompts, report):
 
 
 def print_report(report):
+    system = report["system"]
+    print(
+        f"Platform: {system['platform']} | PyTorch {system['pytorch_version']} | "
+        f"CUDA {system['cuda_runtime_version']} | device {system['cuda_device']}"
+    )
+    print(
+        f"Model: {report['settings']['model_id']} | "
+        f"dtype {report['settings']['dtype']} | "
+        f"vLLM {report['engine_metadata'].get('vllm_version', 'n/a')}"
+    )
     print(
         "engine | offered RPS | achieved RPS | goodput RPS | output tok/s | "
         "TTFT p50/p95 (ms) | TPOT p50/p95 (ms) | E2E p50/p95 (ms) | failures"
@@ -734,6 +744,25 @@ def print_report(report):
             f"{latency_pair(tpot)} | "
             f"{latency_pair(e2e)} | "
             f"{len(result['failed_requests'])}"
+        )
+
+    for result in report["results"]:
+        telemetry = result["gpu_telemetry"]
+        if not telemetry or not telemetry.get("sample_count"):
+            continue
+        utilization = telemetry["gpu_kernel_active_percent"]
+        memory_activity = telemetry["memory_active_percent"]
+        used_memory = telemetry["gpu_memory_used_mb"]
+        total_memory = telemetry["gpu_memory_total_mb"]
+        print(
+            f"GPU telemetry ({result['offered_request_rate']} RPS, "
+            f"{telemetry['sample_count']} samples): "
+            f"kernel mean/p95/max={utilization['mean']:.1f}/"
+            f"{utilization['p95']:.1f}/{utilization['maximum']:.1f}% | "
+            f"memory activity mean/p95/max={memory_activity['mean']:.1f}/"
+            f"{memory_activity['p95']:.1f}/{memory_activity['maximum']:.1f}% | "
+            f"VRAM mean/max={used_memory['mean']:.0f}/"
+            f"{used_memory['maximum']:.0f} MiB of {total_memory:.0f} MiB"
         )
 
 
