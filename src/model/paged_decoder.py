@@ -206,9 +206,8 @@ class PagedDecoderLM(nn.Module):
 
     def embedding_helper(self, input_ids, position_ids):
         assert input_ids.size() == position_ids.size()
-        assert (position_ids >= 0).all().item()
-        if (position_ids >= self.config.max_sequence_length).any().item():
-            raise ValueError("Position ID exceeds maximum sequence length")
+        if position_ids.dtype != torch.long:
+            raise ValueError("Position IDs must use torch.long")
 
         token_embeddings = self.embedding_table(input_ids)
         position_embeddings = self.position_embeddings(position_ids)
@@ -239,6 +238,12 @@ class PagedDecoderLM(nn.Module):
             reserved_position, _, _ = kv_manager.reserve_token_slot(request_id)
             position_ids.append(reserved_position)
 
+        if any(
+            position_id >= self.config.max_sequence_length
+            for position_id in position_ids
+        ):
+            raise ValueError("Position ID exceeds maximum sequence length")
+
         position_ids = torch.tensor(position_ids, dtype=torch.long, device=input_ids.device).unsqueeze(1)
         hidden_states = self.embedding_helper(input_ids, position_ids)
 
@@ -262,6 +267,10 @@ class PagedDecoderLM(nn.Module):
         prefill_cache = {item.request_id: [] for item in iteration_batch.items if item.phase == "prefill"}
 
         for item in iteration_batch.items:
+            if item.position_ids[0] < 0:
+                raise ValueError("Position IDs cannot be negative")
+            if item.position_ids[-1] >= self.config.max_sequence_length:
+                raise ValueError("Position ID exceeds maximum sequence length")
             if item.phase == "prefill":
                 prefill_start = item.position_ids[0]
                 expected_positions = tuple(
@@ -313,8 +322,6 @@ class PagedDecoderLM(nn.Module):
                 kv_manager.commit_token(item.request_id)
 
         return logits
-
-
 
 
 

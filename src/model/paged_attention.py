@@ -1,6 +1,7 @@
 from typing import Dict, Sequence, Tuple
 
 import torch
+from torch.nn import functional as F
 from src.model.iteration import IterationItem
 from src.model.kv_manager import KVCacheManager
 
@@ -81,13 +82,35 @@ class PagedAttention:
         batch_size = len(request_ids)
         assert queries.shape == (batch_size, self.num_kv_heads, self.head_dim)
 
-        outputs = []
+        keys, values, valid_positions = self.kv_manager.gather_decode_layer_batch(
+            request_ids,
+            layer_id,
+        )
+        attention_mask = valid_positions[:, None, None, :]
+        output = F.scaled_dot_product_attention(
+            queries.unsqueeze(2),
+            keys,
+            values,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+        )
+        return output.squeeze(2)
 
-        for batch_index, request_id in enumerate(request_ids):
-            request_output = self.forward(request_id=request_id, layer_id=layer_id, query=queries[batch_index])
-            outputs.append(request_output)
+    def causal_prefill_batch(self, queries, keys, values):
+        """Run equal-length fresh prompts through one batched SDPA call."""
+        if queries.ndim != 4:
+            raise ValueError("Batched prefill queries must be [batch, tokens, heads, dim]")
+        if keys.shape != queries.shape or values.shape != queries.shape:
+            raise ValueError("Batched prefill Q/K/V tensors must have matching shapes")
 
-        return torch.stack(outputs, dim=0)
+        output = F.scaled_dot_product_attention(
+            queries.transpose(1, 2),
+            keys.transpose(1, 2),
+            values.transpose(1, 2),
+            dropout_p=0.0,
+            is_causal=True,
+        )
+        return output.transpose(1, 2)
 
     def causal_prefill(
         self,
@@ -153,34 +176,85 @@ class PagedAttention:
                 decode_values,
             )
 
+        if decode_items:
+            decode_offsets = [item.start_offset for item in decode_items]
+            decode_queries = torch.stack([queries[offset] for offset in decode_offsets])
+            decode_outputs = self.forward_batch(
+                decode_request_ids,
+                layer_id,
+                decode_queries,
+            )
+            decode_offsets = torch.tensor(
+                decode_offsets,
+                dtype=torch.long,
+                device=outputs.device,
+            )
+            outputs[decode_offsets] = decode_outputs
+
+        fresh_prefill_groups = {}
         for item in items:
+            if item.phase == "prefill" and item.position_ids[0] == 0:
+                fresh_prefill_groups.setdefault(item.token_count, []).append(item)
+
+        for token_count, group in fresh_prefill_groups.items():
+            group_queries = torch.stack(
+                [queries[item.start_offset:item.end_offset] for item in group]
+            )
+            group_keys = torch.stack(
+                [keys[item.start_offset:item.end_offset] for item in group]
+            )
+            group_values = torch.stack(
+                [values[item.start_offset:item.end_offset] for item in group]
+            )
+            group_outputs = self.causal_prefill_batch(
+                group_queries,
+                group_keys,
+                group_values,
+            )
+            group_offsets = torch.tensor(
+                [
+                    offset
+                    for item in group
+                    for offset in range(item.start_offset, item.end_offset)
+                ],
+                dtype=torch.long,
+                device=outputs.device,
+            )
+            outputs[group_offsets] = group_outputs.reshape(
+                len(group) * token_count,
+                self.num_kv_heads,
+                self.head_dim,
+            )
+            for item, item_keys, item_values in zip(group, group_keys, group_values):
+                prefill_kv[item.request_id] = (
+                    item_keys.transpose(0, 1),
+                    item_values.transpose(0, 1),
+                )
+
+        for item in items:
+            if item.phase == "decode":
+                continue
+            if item.position_ids[0] == 0:
+                continue
             item_slice = slice(item.start_offset, item.end_offset)
             item_queries = queries[item_slice]
 
-            if item.phase == "prefill":
-                item_keys = keys[item_slice]
-                item_values = values[item_slice]
-                past_keys = None
-                past_values = None
-                if item.position_ids[0] > 0:
-                    past_keys, past_values = self.kv_manager.gather_layer(
-                        item.request_id,
-                        layer_id,
-                    )
-                    past_keys = past_keys.squeeze(0)
-                    past_values = past_values.squeeze(0)
-                outputs[item_slice] = self.causal_prefill(
-                    item_queries,
-                    item_keys,
-                    item_values,
-                    past_keys,
-                    past_values,
-                )
-                prefill_kv[item.request_id] = (item_keys.transpose(0, 1), item_values.transpose(0, 1))
-            else:
-                outputs[item_slice] = self.forward(request_id=item.request_id,
-                                                   layer_id=layer_id,
-                                                   query=item_queries[0],
-                                                   ).unsqueeze(0)
+            item_keys = keys[item_slice]
+            item_values = values[item_slice]
+            past_keys, past_values = self.kv_manager.gather_layer(
+                item.request_id,
+                layer_id,
+            )
+            outputs[item_slice] = self.causal_prefill(
+                item_queries,
+                item_keys,
+                item_values,
+                past_keys.squeeze(0),
+                past_values.squeeze(0),
+            )
+            prefill_kv[item.request_id] = (
+                item_keys.transpose(0, 1),
+                item_values.transpose(0, 1),
+            )
 
         return outputs, prefill_kv

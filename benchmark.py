@@ -11,7 +11,7 @@ from pathlib import Path
 
 import torch
 
-from main import SUPPORTED_MODELS, build_scheduler
+from main import SUPPORTED_DTYPES, SUPPORTED_MODELS, build_scheduler
 from src.scheduler.orca_scheduler import (
     ORCA_STRATEGY,
     SUPPORTED_SCHEDULING_STRATEGIES,
@@ -99,6 +99,9 @@ def benchmark_model(
     seed,
     scheduling_strategy,
     prefill_chunk_size,
+    max_batch_size,
+    kv_cache_memory_mb,
+    execution_dtype,
 ):
     # This makes the locally initialized reference model reproducible.
     torch.manual_seed(seed)
@@ -108,6 +111,9 @@ def benchmark_model(
         model_name,
         scheduling_strategy=scheduling_strategy,
         prefill_chunk_size=prefill_chunk_size,
+        max_batch_size=max_batch_size,
+        kv_cache_memory_mb=kv_cache_memory_mb,
+        execution_dtype=execution_dtype,
     )
     synchronize_device()
     load_seconds = time.perf_counter() - load_started_at
@@ -141,6 +147,9 @@ def benchmark_model(
             prefill_chunk_size if scheduling_strategy != ORCA_STRATEGY else None
         ),
         "device": str(next(model.parameters()).device),
+        "dtype": str(next(model.parameters()).dtype),
+        "max_batch_size": scheduler.max_batch_size,
+        "kv_cache_memory_mb": scheduler.kv_manager.total_memory / (1024 * 1024),
         "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
         "prompt_tokens": len(scheduler.tokenizer.encode(prompt)),
         "load_seconds": load_seconds,
@@ -193,7 +202,7 @@ def print_results(report):
         f"threads {metadata['pytorch_intraop_threads']} | seed {settings['seed']}"
     )
     print(
-        "model | strategy | device | params | load (s) | latency median/p95 (s) | "
+        "model | strategy | device/dtype | params | load (s) | latency median/p95 (s) | "
         "TTFT median/p95 (s) | tokens/s | tokens"
     )
     print("-" * 125)
@@ -203,7 +212,7 @@ def print_results(report):
         print(
             f"{result['model']} | "
             f"{result['strategy']} | "
-            f"{result['device']} | "
+            f"{result['device']}/{result['dtype']} | "
             f"{result['parameter_count']:,} | "
             f"{result['load_seconds']:.6f} | "
             f"{latency['median']:.6f}/{latency['p95']:.6f} | "
@@ -243,6 +252,22 @@ def parse_args():
         help="prompt tokens per Sarathi prefill chunk",
     )
     parser.add_argument(
+        "--max-batch-size",
+        type=positive_integer,
+        help="maximum requests per scheduler iteration",
+    )
+    parser.add_argument(
+        "--kv-cache-memory-mb",
+        type=positive_integer,
+        help="KV-cache memory budget in MiB",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=SUPPORTED_DTYPES,
+        default="float32",
+        help="execution dtype; benchmark different dtypes separately",
+    )
+    parser.add_argument(
         "--json-output",
         type=Path,
         help="optional path for metadata, summary statistics, and every raw run",
@@ -266,6 +291,9 @@ def main():
             "measured_runs": args.runs,
             "seed": args.seed,
             "prefill_chunk_size": args.prefill_chunk_size,
+            "max_batch_size": args.max_batch_size,
+            "kv_cache_memory_mb": args.kv_cache_memory_mb,
+            "dtype": args.dtype,
         },
         "results": [],
     }
@@ -284,6 +312,9 @@ def main():
                     seed=args.seed,
                     scheduling_strategy=scheduling_strategy,
                     prefill_chunk_size=args.prefill_chunk_size,
+                    max_batch_size=args.max_batch_size,
+                    kv_cache_memory_mb=args.kv_cache_memory_mb,
+                    execution_dtype=args.dtype,
                 )
             )
 

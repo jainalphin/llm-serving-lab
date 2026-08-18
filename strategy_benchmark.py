@@ -13,7 +13,7 @@ from benchmark import (
     synchronize_device,
     system_metadata,
 )
-from main import DISTILGPT2_MODEL, SUPPORTED_MODELS, build_scheduler
+from main import DISTILGPT2_MODEL, SUPPORTED_DTYPES, SUPPORTED_MODELS, build_scheduler
 from src.scheduler.orca_scheduler import ORCA_STRATEGY, SARATHI_STRATEGY
 
 
@@ -78,11 +78,17 @@ def benchmark_strategy(
     long_prompt,
     warmup_runs,
     measured_runs,
+    max_batch_size,
+    kv_cache_memory_mb,
+    execution_dtype,
 ):
     scheduler = build_scheduler(
         model_name,
         scheduling_strategy=strategy,
         prefill_chunk_size=prefill_chunk_size,
+        max_batch_size=max_batch_size,
+        kv_cache_memory_mb=kv_cache_memory_mb,
+        execution_dtype=execution_dtype,
     )
     if active_decode_count >= scheduler.max_batch_size:
         raise ValueError("active decodes must leave one slot for a prefill chunk")
@@ -114,6 +120,7 @@ def benchmark_strategy(
         "model": model_name,
         "strategy": strategy,
         "device": str(next(scheduler.model_engine.parameters()).device),
+        "dtype": str(next(scheduler.model_engine.parameters()).dtype),
         "prompt_tokens": prompt_tokens,
         "prefill_chunk_size": (
             prefill_chunk_size if strategy == SARATHI_STRATEGY else None
@@ -138,6 +145,13 @@ def parse_args():
     parser.add_argument("--long-prompt-repetitions", type=positive_integer, default=7)
     parser.add_argument("--warmup-runs", type=non_negative_integer, default=2)
     parser.add_argument("--runs", type=positive_integer, default=10)
+    parser.add_argument("--max-batch-size", type=positive_integer)
+    parser.add_argument("--kv-cache-memory-mb", type=positive_integer)
+    parser.add_argument(
+        "--dtype",
+        choices=SUPPORTED_DTYPES,
+        default="float32",
+    )
     parser.add_argument("--json-output", type=Path)
     return parser.parse_args()
 
@@ -154,6 +168,9 @@ def main():
             "long_prompt_repetitions": args.long_prompt_repetitions,
             "warmup_runs": args.warmup_runs,
             "measured_runs": args.runs,
+            "max_batch_size": args.max_batch_size,
+            "kv_cache_memory_mb": args.kv_cache_memory_mb,
+            "dtype": args.dtype,
         },
         "results": [],
     }
@@ -169,6 +186,9 @@ def main():
                 long_prompt=long_prompt,
                 warmup_runs=args.warmup_runs,
                 measured_runs=args.runs,
+                max_batch_size=args.max_batch_size,
+                kv_cache_memory_mb=args.kv_cache_memory_mb,
+                execution_dtype=args.dtype,
             )
         )
 

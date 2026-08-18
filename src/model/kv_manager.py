@@ -164,24 +164,55 @@ class KVCacheManager:
             if layer_value_cache.shape != expected_shape:
                 raise ValueError("Unexpected prefill value-cache shape")
 
-        for token_index in range(number_of_prompt_token):
-            self.reserve_token_slot(request_id)
-            for layer_id in range(self.num_layers):
+        request_info = self.requests[request_id]
+        expected_existing_blocks = math.ceil(start_position / self.block_size)
+        if len(request_info.block_ids) != expected_existing_blocks:
+            raise RuntimeError("KV block table does not match the prefill start position")
 
-                layer_key_cache = layer_kv_cache[layer_id][0]
-                layer_value_cache = layer_kv_cache[layer_id][1]
+        end_position = start_position + number_of_prompt_token
+        required_blocks = math.ceil(end_position / self.block_size)
+        missing_blocks = required_blocks - len(request_info.block_ids)
+        allocated_blocks = []
+        try:
+            for _ in range(missing_blocks):
+                allocated_blocks.append(self.allocate_block())
+        except Exception:
+            for block_id in allocated_blocks:
+                self.free_block(block_id)
+            raise
+        request_info.block_ids.extend(allocated_blocks)
 
-                new_key = layer_key_cache[:, token_index, :]
-                new_value = layer_value_cache[:, token_index, :]
+        # Stack every layer so each physical block is written with two batched
+        # device copies instead of copying every token and layer independently.
+        stacked_keys = torch.stack(
+            [layer_key for layer_key, _ in layer_kv_cache],
+            dim=0,
+        )
+        stacked_values = torch.stack(
+            [layer_value for _, layer_value in layer_kv_cache],
+            dim=0,
+        )
 
-                self._write_reserved_layer(
-                    self.requests[request_id],
-                    layer_id,
-                    new_key,
-                    new_value,
-                )
+        first_logical_block = start_position // self.block_size
+        last_logical_block = (end_position - 1) // self.block_size
+        for logical_block in range(first_logical_block, last_logical_block + 1):
+            block_start = logical_block * self.block_size
+            segment_start = max(start_position, block_start)
+            segment_end = min(end_position, block_start + self.block_size)
+            source_start = segment_start - start_position
+            source_end = segment_end - start_position
+            block_offset = segment_start - block_start
+            block_end = block_offset + (segment_end - segment_start)
+            physical_block = request_info.block_ids[logical_block]
 
-            self.commit_token(request_id)
+            self.key_pool[
+                :, physical_block, :, block_offset:block_end, :
+            ] = stacked_keys[:, :, source_start:source_end, :]
+            self.value_pool[
+                :, physical_block, :, block_offset:block_end, :
+            ] = stacked_values[:, :, source_start:source_end, :]
+
+        request_info.sequence_length = end_position
 
     def store_prefill(self, request_id, kv_cache, batch_index=0):
         request_cache = []
@@ -294,3 +325,63 @@ class KVCacheManager:
         layer_value = layer_value.unsqueeze(0)
 
         return layer_key, layer_value
+
+    def gather_decode_layer_batch(self, request_ids, layer_id):
+        """Gather variable-length decode contexts with one batched pool lookup."""
+        if not request_ids:
+            raise ValueError("request_ids cannot be empty")
+        if len(request_ids) != len(set(request_ids)):
+            raise ValueError("request_ids must be unique")
+        if not 0 <= layer_id < self.num_layers:
+            raise ValueError("Invalid layer_id")
+
+        request_infos = [self.requests[request_id] for request_id in request_ids]
+        for request_id, request_info in zip(request_ids, request_infos):
+            if request_info.reserved_position is None:
+                raise RuntimeError(f"Request {request_id} has no reserved decode token")
+            if layer_id not in request_info.written_layer_ids:
+                raise RuntimeError(f"Request {request_id} has not written layer {layer_id}")
+            if not request_info.block_ids:
+                raise RuntimeError(f"Request {request_id} has no KV blocks")
+
+        context_lengths = [
+            request_info.sequence_length + 1 for request_info in request_infos
+        ]
+        maximum_blocks = max(len(request_info.block_ids) for request_info in request_infos)
+        block_table = [
+            request_info.block_ids
+            + [request_info.block_ids[-1]]
+            * (maximum_blocks - len(request_info.block_ids))
+            for request_info in request_infos
+        ]
+        block_table = torch.tensor(
+            block_table,
+            dtype=torch.long,
+            device=self.key_pool.device,
+        )
+
+        # [batch, blocks, heads, block, dim] -> [batch, heads, tokens, dim]
+        keys = self.key_pool[layer_id, block_table].permute(0, 2, 1, 3, 4)
+        values = self.value_pool[layer_id, block_table].permute(0, 2, 1, 3, 4)
+        keys = keys.reshape(len(request_ids), self.num_kv_heads, -1, self.head_dim)
+        values = values.reshape(len(request_ids), self.num_kv_heads, -1, self.head_dim)
+
+        maximum_context = max(context_lengths)
+        keys = keys[:, :, :maximum_context, :]
+        values = values[:, :, :maximum_context, :]
+        length_tensor = torch.tensor(
+            context_lengths,
+            dtype=torch.long,
+            device=self.key_pool.device,
+        )
+        valid_positions = torch.arange(
+            maximum_context,
+            device=self.key_pool.device,
+        ).unsqueeze(0) < length_tensor.unsqueeze(1)
+
+        # Padded blocks may point at arbitrary cache data; zero them before the
+        # value matmul so masked probabilities cannot propagate uninitialized NaNs.
+        invalid_positions = ~valid_positions[:, None, :, None]
+        keys = keys.masked_fill(invalid_positions, 0)
+        values = values.masked_fill(invalid_positions, 0)
+        return keys, values, valid_positions

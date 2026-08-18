@@ -69,10 +69,28 @@ class ContinuousBatchScheduler:
     def add_request(self, prompt, max_new_tokens=200):
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt must be a non-empty string")
-        if max_new_tokens <= 0:
-            raise ValueError("max_new_tokens must be positive")
 
         prompt_token_ids = self.tokenizer.encode(prompt)
+        if isinstance(prompt_token_ids, torch.Tensor):
+            prompt_token_ids = prompt_token_ids.reshape(-1).tolist()
+        else:
+            prompt_token_ids = list(prompt_token_ids)
+
+        return self.add_token_request(
+            prompt_token_ids,
+            max_new_tokens=max_new_tokens,
+            prompt=prompt,
+        )
+
+    def add_token_request(
+        self,
+        prompt_token_ids,
+        max_new_tokens=200,
+        prompt="<tokenized prompt>",
+    ):
+        """Add an already-tokenized request for exact workload reproduction."""
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
         if isinstance(prompt_token_ids, torch.Tensor):
             prompt_token_ids = prompt_token_ids.reshape(-1).tolist()
         else:

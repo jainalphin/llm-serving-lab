@@ -311,6 +311,84 @@ def test_paged_attention_matches_contiguous_attention():
     assert manager.requests[request_id].sequence_length == 5
 
 
+def test_batched_decode_attention_matches_scalar_with_variable_contexts():
+    torch.manual_seed(43)
+    num_heads = 2
+    head_dim = 4
+    manager = KVCacheManager(
+        block_size=2,
+        total_memory=16 * 1024,
+        tensor_dtype=torch.float32,
+        device="cpu",
+        num_layers=1,
+        num_kv_heads=num_heads,
+        head_dim=head_dim,
+    )
+    attention = PagedAttention(manager)
+    request_ids = ["short", "medium", "long"]
+    context_lengths = [1, 3, 5]
+    queries = torch.randn(len(request_ids), num_heads, head_dim)
+
+    for request_id, context_length in zip(request_ids, context_lengths):
+        prompt_length = context_length - 1
+        if prompt_length:
+            manager.store_prefill_request(
+                request_id,
+                [
+                    (
+                        torch.randn(num_heads, prompt_length, head_dim),
+                        torch.randn(num_heads, prompt_length, head_dim),
+                    )
+                ],
+            )
+        manager.reserve_token_slot(request_id)
+        manager.write_layer_kv(
+            request_id,
+            0,
+            torch.randn(num_heads, head_dim),
+            torch.randn(num_heads, head_dim),
+        )
+
+    expected = torch.stack(
+        [
+            attention.forward(request_id, 0, query)
+            for request_id, query in zip(request_ids, queries)
+        ]
+    )
+    actual = attention.forward_batch(request_ids, 0, queries)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_batched_fresh_prefill_matches_individual_causal_attention():
+    torch.manual_seed(44)
+    batch_size = 3
+    token_count = 5
+    num_heads = 2
+    head_dim = 4
+    manager = KVCacheManager(
+        block_size=2,
+        total_memory=16 * 1024,
+        tensor_dtype=torch.float32,
+        device="cpu",
+        num_layers=1,
+        num_kv_heads=num_heads,
+        head_dim=head_dim,
+    )
+    attention = PagedAttention(manager)
+    queries = torch.randn(batch_size, token_count, num_heads, head_dim)
+    keys = torch.randn_like(queries)
+    values = torch.randn_like(queries)
+
+    expected = torch.stack(
+        [
+            attention.causal_prefill(query, key, value)
+            for query, key, value in zip(queries, keys, values)
+        ]
+    )
+    actual = attention.causal_prefill_batch(queries, keys, values)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
 def test_prefill():
     config = TransformerConfig(
         vocab_size=100,
