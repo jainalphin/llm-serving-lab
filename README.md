@@ -267,6 +267,138 @@ PYTHONPATH=. python dual_gpu_capacity_benchmark.py \
   --output-dir /tmp/vllm-dual-capacity
 ```
 
+Run the simple sequential Hugging Face baseline with the same two-replica layout:
+
+```bash
+PYTHONPATH=. python dual_gpu_capacity_benchmark.py \
+  --engine hf \
+  --dtype float16 \
+  --input-length 128 \
+  --output-length 32 \
+  --request-rate 20 \
+  --request-rate 30 \
+  --request-rate 40 \
+  --request-rate 50 \
+  --request-rate 60 \
+  --request-rate 70 \
+  --request-rate 80 \
+  --output-dir /tmp/hf-dual-capacity
+```
+
+This HF control runs one request at a time on each GPU. It measures two replicated
+plain Transformers workers, not a dynamically batched Hugging Face serving stack.
+
+## Run and temporarily publish the full suite
+
+`run_all_benchmarks.sh` runs both GPT-2 and DistilGPT-2 by default across HF,
+PagedServe Orca, PagedServe Sarathi, and vLLM. It records environment metadata,
+resolved packages, tests, commands, console summaries, raw temporary results, and
+SHA-256 checksums. `REPORT.md` is the single readable run summary; the JSON files
+under each case are the machine-readable evidence behind it.
+With `--push`, it commits those artifacts to a new timestamped branch such as
+`benchmark-results/20260818T120000Z`; it never pushes benchmark data to `main`.
+
+Each worker profile records:
+
+- hardware, driver, CUDA, PyTorch, Python, git commit, and the exact command;
+- model architecture, parameter count, configured context window, runtime weight
+  and buffer bytes, checkpoint files and disk bytes, dtype, and load/warm-up time;
+- PagedServe KV bytes, bytes per token/block, total blocks/tokens, maximum-length
+  request capacity, memory-budget source, and peak live KV pages per load point;
+- vLLM's reported KV-cache bytes, blocks, token capacity, and concurrency when the
+  installed vLLM version exposes those initialized cache-config fields;
+- CUDA allocator start/end/peak allocated and reserved bytes, plus device-wide
+  VRAM before model load, after initialization, after warm-up, and during traffic;
+- offered/achieved RPS, successful and failed requests, output tokens/s, SLO
+  goodput, client queue delay, engine TTFT after submission, and total
+  TTFT/TPOT/ITL/E2E distributions including p50, p95, and p99;
+- sampled GPU kernel activity, memory-controller activity, VRAM, power draw, power
+  limit, and estimated energy per run, output token, and successful request.
+
+The device-wide `nvidia-smi` memory reading is the cross-engine comparison value.
+PyTorch allocator counters are supplementary because an engine may own memory
+outside PyTorch's caching allocator. Power-derived energy is an estimate from the
+configured sampling interval, not a hardware energy-counter measurement. This
+suite is serving-level profiling; it does not claim per-CUDA-kernel timing from
+Nsight Systems or Nsight Compute.
+
+Store a fine-grained GitHub token with repository Contents read/write permission as
+a private Kaggle secret named `GH_TOKEN`, then expose it without printing it:
+
+```python
+import os
+from kaggle_secrets import UserSecretsClient
+
+os.environ["GH_TOKEN"] = UserSecretsClient().get_secret("GH_TOKEN")
+```
+
+Run the full dual-T4 suite and push only after every case succeeds:
+
+```bash
+bash run_all_benchmarks.sh \
+  --requests-per-replica 120 \
+  --push
+```
+
+For a production-style capacity test, use mixed request sizes, independent
+Poisson arrivals on each replica, rates above the expected 50–60 RPS operating
+point, and three cold engine repetitions:
+
+```bash
+bash run_all_benchmarks.sh \
+  --production-only \
+  --production-rate 30 \
+  --production-rate 50 \
+  --production-rate 60 \
+  --production-rate 80 \
+  --production-rate 100 \
+  --production-rate 120 \
+  --requests-per-replica 500 \
+  --repetitions 3 \
+  --ttft-slo-ms YOUR_TTFT_LIMIT \
+  --tpot-slo-ms YOUR_TPOT_LIMIT \
+  --e2e-slo-ms YOUR_E2E_LIMIT \
+  --push
+```
+
+The built-in production-like mix is 50% 128-input/32-output, 30% 384/64,
+15% 768/96, and 5% 900/64. These are explicit starting assumptions, not claims
+about your users. Replace them with an anonymized production length/arrival trace
+before making a final deployment decision.
+
+This track measures the inference workers and two-replica load split. It still
+does not include an HTTP gateway, TLS, JSON serialization, request tokenization,
+network transit, autoscaling, or multi-host failures. Those require a deployed
+end-to-end load test; the report labels this track `production-mix`, not a measured
+production service.
+
+Add GPT-2-family checkpoints with repeated `--model` arguments. Supplying any
+`--model` replaces the defaults:
+
+```bash
+bash run_all_benchmarks.sh \
+  --model openai-community/gpt2 \
+  --model distilbert/distilgpt2 \
+  --model openai-community/gpt2-medium \
+  --requests-per-replica 120 \
+  --push
+```
+
+The current PagedServe converter supports GPT2LMHeadModel-family checkpoints. For
+another architecture, benchmark only the compatible HF and vLLM paths:
+
+```bash
+bash run_all_benchmarks.sh \
+  --model MODEL_ID \
+  --engine hf \
+  --engine vllm \
+  --push
+```
+
+At completion the script prints `BENCHMARK_RESULTS_BRANCH=...`. Fetch that branch
+for review; after its verified summaries are copied into `BENCHMARKS.md`, delete the
+temporary remote branch.
+
 Repeat with `--input-length 900 --output-length 64` for near-maximum GPT-2
 context. Add your actual `--ttft-slo-ms`, `--tpot-slo-ms`, and `--e2e-slo-ms`
 requirements to measure SLO-qualified goodput. Memory capacity and sustainable RPS

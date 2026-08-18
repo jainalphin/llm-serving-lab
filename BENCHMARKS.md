@@ -230,3 +230,53 @@ performance, but it also preallocated 80% of GPU memory. PagedServe used a small
 measure of memory efficiency. The T4 cannot use FlashAttention 2; vLLM selected its
 Triton attention backend. These are single-run, 30-request results and should be
 repeated before treating small differences as stable.
+
+### Two-T4 PagedServe capacity curve
+
+After automatic KV sizing was added, two independent Orca replicas were run
+concurrently, one per T4, with the total offered load divided evenly. Each worker
+used FP16 GPT-2, 128 input tokens, 32 output tokens, a maximum batch of 128, and
+120 requests per offered rate. Each T4 allocated 237.4 MiB for model parameters and
+11,478.8 MiB for the KV cache, providing 326,496 cached tokens or 318 maximum-length
+requests per replica. This is 652,992 tokens across the deployment, but the two
+physical KV pools are not shared.
+
+| Total offered RPS | Aggregate achieved RPS | Output tok/s | TTFT p50/p95 | TPOT p50/p95 | E2E p50/p95 | GPU kernel mean (GPU 0/1) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 30 | 28.503 | 912.09 | 26.35 / 34.90 ms | 16.47 / 17.66 ms | 537.79 / 576.77 ms | 38.5 / 38.1% |
+| 40 | 37.143 | 1188.57 | 28.02 / 35.29 ms | 17.52 / 19.07 ms | 571.59 / 616.61 ms | 37.7 / 37.9% |
+| 50 | 45.424 | 1453.56 | 29.10 / 38.55 ms | 18.96 / 22.39 ms | 613.14 / 729.16 ms | 36.8 / 37.2% |
+| 60 | 53.372 | 1707.89 | 31.67 / 40.71 ms | 21.04 / 22.69 ms | 682.26 / 732.56 ms | 38.5 / 39.0% |
+| 70 | 60.391 | 1932.51 | 34.06 / 47.18 ms | 24.44 / 26.50 ms | 792.15 / 860.96 ms | 39.3 / 40.6% |
+| 80 | 66.885 | 2140.31 | 38.45 / 53.77 ms | 26.06 / 28.79 ms | 840.76 / 935.20 ms | 42.3 / 40.1% |
+
+Every request completed and observed VRAM remained between 11,897 and 11,921 MiB
+per T4, leaving more than 3.4 GiB unused for runtime headroom. The increasing TPOT
+and E2E latency show rising compute/software pressure while TTFT remains bounded.
+The achieved-RPS column includes finite-trace drain time, so it underestimates a
+stable arrival rate when the trace is short. No latency SLO was supplied; therefore
+this run does not establish SLO-qualified goodput or a maximum sustainable RPS.
+For example only, a p95 E2E objective of 750 ms would admit the 60-RPS row but not
+the 70-RPS row. A longer steady-state repeat is required before treating that
+boundary as deployment capacity.
+
+### Two-T4 vLLM capacity curve
+
+The identical two-replica 128-input/32-output workload was run with vLLM 0.27.1.
+Each T4 reserved 12,347 MiB. All requests completed without failures.
+
+| Total offered RPS | Aggregate achieved RPS | Output tok/s | TTFT p50/p95 | TPOT p50/p95 | E2E p50/p95 | GPU kernel mean (GPU 0/1) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 30 | 29.814 | 954.04 | 20.43 / 24.84 ms | 3.38 / 3.72 ms | 125.55 / 137.56 ms | 49.3 / 50.0% |
+| 40 | 39.629 | 1268.12 | 20.67 / 25.83 ms | 3.80 / 4.20 ms | 138.70 / 153.49 ms | 50.6 / 50.8% |
+| 50 | 49.324 | 1578.36 | 20.32 / 24.66 ms | 4.02 / 4.48 ms | 144.58 / 161.54 ms | 51.8 / 51.1% |
+| 60 | 58.906 | 1885.00 | 20.11 / 24.94 ms | 4.32 / 4.85 ms | 154.74 / 172.04 ms | 52.1 / 51.4% |
+| 70 | 68.081 | 2178.59 | 20.71 / 23.89 ms | 4.65 / 5.19 ms | 165.26 / 187.26 ms | 52.9 / 53.2% |
+| 80 | 77.726 | 2487.24 | 20.68 / 24.30 ms | 4.96 / 5.84 ms | 174.28 / 203.03 ms | 53.1 / 53.2% |
+
+At the 60-RPS target, vLLM delivered 10.4% more aggregate throughput than
+PagedServe Orca, with 38.7% lower p95 TTFT, 78.6% lower p95 TPOT, and 76.5% lower
+p95 E2E latency. At 80 offered RPS, vLLM delivered 16.2% more throughput and 78.3%
+lower p95 E2E latency. Latency remained controlled through the highest tested load,
+so this curve did not find vLLM's saturation point. As in the PagedServe run, no
+SLO was supplied and the finite trace is not a long-duration stability test.

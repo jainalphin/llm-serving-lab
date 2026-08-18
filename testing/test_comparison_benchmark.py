@@ -10,6 +10,7 @@ from comparison_benchmark import (
     create_monitor,
     deterministic_prompts,
     request_metrics,
+    request_shapes,
     summarize_scenario,
 )
 
@@ -36,6 +37,30 @@ def test_arrival_offsets_support_fixed_rate_and_burst():
     assert arrival_offsets(math.inf, 4) == [0.0, 0.0, 0.0, 0.0]
 
 
+def test_poisson_arrivals_are_deterministic_and_not_fixed_interval():
+    first = arrival_offsets(10.0, 5, pattern="poisson", seed=7)
+    second = arrival_offsets(10.0, 5, pattern="poisson", seed=7)
+    assert first == second
+    assert first[0] == 0
+    assert first == sorted(first)
+    assert first != arrival_offsets(10.0, 5, pattern="fixed", seed=7)
+
+
+def test_weighted_request_shapes_are_repeatable_and_valid():
+    args = SimpleNamespace(
+        request_shape=[(128, 32, 50), (900, 64, 5)],
+        input_length=1,
+        output_length=1,
+        num_requests=100,
+        seed=1234,
+    )
+    first = request_shapes(args)
+    second = request_shapes(args)
+    assert first == second
+    assert len(first[0]) == 100
+    assert set(zip(*first)) <= {(128, 32), (900, 64)}
+
+
 def test_common_request_metrics_and_goodput():
     records = [
         RequestRecord(
@@ -53,6 +78,8 @@ def test_common_request_metrics_and_goodput():
     ]
     first = request_metrics(records[0])
     assert math.isclose(first["ttft"], 0.1)
+    assert first["queue_delay"] == 0
+    assert math.isclose(first["engine_ttft"], 0.1)
     assert math.isclose(first["tpot"], 0.1)
     assert math.isclose(first["e2e"], 0.3)
 
@@ -86,6 +113,20 @@ def test_common_request_metrics_and_goodput():
     assert no_slo_summary["goodput_requests_per_second"] is None
 
 
+def test_request_metrics_separate_queue_delay_from_engine_ttft():
+    record = RequestRecord(
+        request_index=0,
+        scheduled_arrival=1.0,
+        submitted_at=1.25,
+        token_times=[1.35, 1.45],
+        token_ids=[4, 5],
+    )
+    metrics = request_metrics(record)
+    assert math.isclose(metrics["queue_delay"], 0.25)
+    assert math.isclose(metrics["engine_ttft"], 0.10)
+    assert math.isclose(metrics["ttft"], 0.35)
+
+
 def test_vllm_delta_stream_records_each_generated_token_once():
     class FakeVLLMEngine:
         async def generate(self, **kwargs):
@@ -115,3 +156,28 @@ def test_gpu_monitor_targets_only_the_first_cuda_visible_device(monkeypatch):
     monkeypatch.setattr("comparison_benchmark.torch.cuda.is_available", lambda: True)
     monitor = create_monitor(SimpleNamespace(telemetry_interval_ms=200))
     assert monitor.gpu_id == "1"
+
+
+def test_summary_estimates_energy_from_sampled_mean_power():
+    record = RequestRecord(
+        request_index=0,
+        scheduled_arrival=0.0,
+        token_times=[0.1, 0.2],
+        token_ids=[4, 5],
+    )
+    telemetry = {"power_draw_watts": {"mean": 50.0}}
+    summary = summarize_scenario(
+        engine="test",
+        request_rate=1.0,
+        records=[record],
+        duration=2.0,
+        output_length=2,
+        telemetry=telemetry,
+        ttft_slo_ms=None,
+        tpot_slo_ms=None,
+        e2e_slo_ms=None,
+    )
+    measured = summary["gpu_telemetry"]
+    assert measured["estimated_energy_joules"] == 100.0
+    assert measured["estimated_joules_per_output_token"] == 50.0
+    assert measured["estimated_joules_per_successful_request"] == 100.0

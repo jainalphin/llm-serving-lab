@@ -28,6 +28,20 @@ DEFAULT_CUDA_KV_MEMORY_UTILIZATION = 0.90
 DEFAULT_CUDA_KV_SAFETY_MB = 3072
 
 
+def cuda_memory_snapshot(device):
+    if device.type != "cuda":
+        return None
+    torch.cuda.synchronize(device)
+    free_memory, total_memory = torch.cuda.mem_get_info(device)
+    return {
+        "free_bytes": free_memory,
+        "total_bytes": total_memory,
+        "device_used_bytes": total_memory - free_memory,
+        "torch_allocated_bytes": torch.cuda.memory_allocated(device),
+        "torch_reserved_bytes": torch.cuda.memory_reserved(device),
+    }
+
+
 def calculate_cuda_kv_cache_budget(
     free_memory,
     total_memory,
@@ -130,6 +144,7 @@ def build_scheduler(
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     resolved_dtype = _resolve_execution_dtype(execution_dtype, device)
+    before_model_memory = cuda_memory_snapshot(device)
     model, tokenizer, config, default_kv_cache_memory = _load_model(
         model_name,
         device,
@@ -137,12 +152,13 @@ def build_scheduler(
         gpt2_model_id,
         distilgpt2_model_id,
     )
+    after_model_memory = cuda_memory_snapshot(device)
     if max_batch_size is None:
         max_batch_size = 32 if device.type == "cuda" else 4
     if max_batch_size <= 0:
         raise ValueError("max_batch_size must be positive")
     memory_budget_source = "model_default"
-    cuda_memory_snapshot = None
+    cuda_budget_snapshot = None
     if (
         kv_cache_memory_mb is None
         and device.type == "cuda"
@@ -157,7 +173,7 @@ def build_scheduler(
             safety_memory=kv_cache_safety_mb * MIB,
         )
         memory_budget_source = "cuda_auto"
-        cuda_memory_snapshot = {
+        cuda_budget_snapshot = {
             "free_bytes_before_kv": free_memory,
             "total_bytes": total_memory,
             "target_utilization": kv_cache_memory_utilization,
@@ -180,12 +196,24 @@ def build_scheduler(
         num_kv_heads=config.num_heads,
         head_dim=config.head_dim,
     )
+    after_kv_memory = cuda_memory_snapshot(device)
     kv_manager.memory_budget_source = memory_budget_source
-    kv_manager.cuda_memory_snapshot = cuda_memory_snapshot
+    kv_manager.cuda_memory_snapshot = cuda_budget_snapshot
     kv_manager.model_parameter_bytes = sum(
         parameter.numel() * parameter.element_size()
         for parameter in model.parameters()
     )
+    kv_manager.model_parameter_count = sum(
+        parameter.numel() for parameter in model.parameters()
+    )
+    kv_manager.model_buffer_bytes = sum(
+        buffer.numel() * buffer.element_size() for buffer in model.buffers()
+    )
+    kv_manager.cuda_allocator_snapshots = {
+        "before_model": before_model_memory,
+        "after_model": after_model_memory,
+        "after_kv_cache": after_kv_memory,
+    }
     paged_attention = PagedAttention(
         kv_manager=kv_manager,
     )

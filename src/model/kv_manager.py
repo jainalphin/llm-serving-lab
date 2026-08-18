@@ -34,6 +34,7 @@ class KVCacheManager:
             )
 
         self.free_blocks = list(range(self.total_available_blocks))
+        self.peak_allocated_blocks = 0
 
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -57,10 +58,36 @@ class KVCacheManager:
     def allocate_block(self):
         if not self.free_blocks:
             raise RuntimeError("KV cache full")
-        return self.free_blocks.pop()
+        block_id = self.free_blocks.pop()
+        allocated_blocks = self.total_available_blocks - len(self.free_blocks)
+        self.peak_allocated_blocks = max(
+            self.peak_allocated_blocks,
+            allocated_blocks,
+        )
+        return block_id
 
     def free_block(self, block_id):
         self.free_blocks.append(block_id)
+
+    def reset_usage_stats(self):
+        self.peak_allocated_blocks = self.total_available_blocks - len(
+            self.free_blocks
+        )
+
+    def usage_summary(self):
+        peak_bytes = self.peak_allocated_blocks * self.bytes_per_block
+        return {
+            "total_blocks": self.total_available_blocks,
+            "free_blocks_at_end": len(self.free_blocks),
+            "peak_allocated_blocks": self.peak_allocated_blocks,
+            "peak_allocated_tokens": self.peak_allocated_blocks * self.block_size,
+            "peak_allocated_bytes": peak_bytes,
+            "peak_utilization_percent": (
+                100 * self.peak_allocated_blocks / self.total_available_blocks
+            ),
+            "bytes_per_block": self.bytes_per_block,
+            "bytes_per_token": self.bytes_per_block // self.block_size,
+        }
 
     def reserve_token_slot(self, request_id):
         request_info = self.requests[request_id]

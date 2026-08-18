@@ -41,6 +41,9 @@ SUPPORTED_ENGINES = ("hf", "pagedserve", "vllm")
 class RequestRecord:
     request_index: int
     scheduled_arrival: float
+    requested_output_length: int | None = None
+    requested_input_length: int | None = None
+    submitted_at: float | None = None
     token_times: list[float] = field(default_factory=list)
     token_ids: list[int] = field(default_factory=list)
     error: str | None = None
@@ -116,11 +119,80 @@ class NullMonitor:
         return None
 
 
+class TorchCUDAMemoryProfiler:
+    def __init__(self):
+        self.enabled = torch.cuda.is_available()
+        self.start_allocated = None
+        self.start_reserved = None
+
+    def start(self):
+        if not self.enabled:
+            return
+        synchronize_cuda()
+        torch.cuda.reset_peak_memory_stats()
+        self.start_allocated = torch.cuda.memory_allocated()
+        self.start_reserved = torch.cuda.memory_reserved()
+
+    def stop(self):
+        if not self.enabled:
+            return None
+        synchronize_cuda()
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        return {
+            "start_allocated_bytes": self.start_allocated,
+            "start_reserved_bytes": self.start_reserved,
+            "end_allocated_bytes": torch.cuda.memory_allocated(),
+            "end_reserved_bytes": torch.cuda.memory_reserved(),
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+            "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+            "device_free_bytes_at_end": free_bytes,
+            "device_total_bytes": total_bytes,
+        }
+
+
+def physical_gpu_id():
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    return visible_devices.split(",", maxsplit=1)[0].strip() or "0"
+
+
+def nvidia_smi_snapshot():
+    if not torch.cuda.is_available():
+        return None
+    fields = (
+        "memory.used,memory.total,utilization.gpu,utilization.memory,"
+        "power.draw,power.limit,temperature.gpu,clocks.sm,clocks.mem,pstate"
+    )
+    try:
+        output = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--id={physical_gpu_id()}",
+                f"--query-gpu={fields}",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        return {"error": str(error)}
+    values = [value.strip() for value in output.split(",")]
+    names = fields.split(",")
+    result = {}
+    for name, value in zip(names, values):
+        try:
+            result[name] = float(value)
+        except ValueError:
+            result[name] = value
+    return result
+
+
 def create_monitor(args):
     if torch.cuda.is_available():
-        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-        physical_gpu = visible_devices.split(",", maxsplit=1)[0].strip() or "0"
-        return NvidiaSMIMonitor(args.telemetry_interval_ms, gpu_id=physical_gpu)
+        return NvidiaSMIMonitor(
+            args.telemetry_interval_ms,
+            gpu_id=physical_gpu_id(),
+        )
     return NullMonitor()
 
 
@@ -157,14 +229,105 @@ def torch_dtype(dtype_name):
     }[dtype_name]
 
 
+def module_memory_profile(model):
+    parameters = list(model.parameters())
+    buffers = list(model.buffers())
+    return {
+        "parameter_count": sum(parameter.numel() for parameter in parameters),
+        "parameter_bytes": sum(
+            parameter.numel() * parameter.element_size()
+            for parameter in parameters
+        ),
+        "buffer_count": sum(buffer.numel() for buffer in buffers),
+        "buffer_bytes": sum(
+            buffer.numel() * buffer.element_size() for buffer in buffers
+        ),
+        "dtype": str(parameters[0].dtype) if parameters else None,
+        "device": str(parameters[0].device) if parameters else None,
+    }
+
+
+def config_profile(config):
+    def first(*names):
+        for name in names:
+            value = getattr(config, name, None)
+            if value is not None:
+                return value
+        return None
+
+    return {
+        "model_type": getattr(config, "model_type", None),
+        "architectures": getattr(config, "architectures", None),
+        "vocab_size": first("vocab_size"),
+        "hidden_size": first("hidden_size", "n_embd"),
+        "num_layers": first("num_hidden_layers", "n_layer"),
+        "num_attention_heads": first("num_attention_heads", "n_head"),
+        "num_key_value_heads": first(
+            "num_key_value_heads",
+            "num_attention_heads",
+            "n_head",
+        ),
+        "intermediate_size": first("intermediate_size", "n_inner"),
+        "max_position_embeddings": first(
+            "max_position_embeddings",
+            "n_positions",
+            "n_ctx",
+        ),
+    }
+
+
+def huggingface_cache_profile(model_id):
+    try:
+        from huggingface_hub import scan_cache_dir
+
+        cache = scan_cache_dir()
+        repository = next(
+            repo
+            for repo in cache.repos
+            if repo.repo_type == "model" and repo.repo_id == model_id
+        )
+        revisions = []
+        for revision in repository.revisions:
+            revisions.append(
+                {
+                    "commit_hash": revision.commit_hash,
+                    "size_on_disk_bytes": revision.size_on_disk,
+                    "files": sorted(
+                        (
+                            {
+                                "name": file.file_name,
+                                "size_on_disk_bytes": file.size_on_disk,
+                            }
+                            for file in revision.files
+                        ),
+                        key=lambda item: item["name"],
+                    ),
+                }
+            )
+        return {
+            "repository_size_on_disk_bytes": repository.size_on_disk,
+            "revisions": revisions,
+        }
+    except Exception as error:
+        return {"error": f"{type(error).__name__}: {error}"}
+
+
 def synchronize_cuda():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
-def arrival_offsets(request_rate, num_requests):
+def arrival_offsets(request_rate, num_requests, pattern="fixed", seed=1234):
     if math.isinf(request_rate):
         return [0.0] * num_requests
+    if pattern == "poisson":
+        generator = random.Random(seed)
+        offsets = [0.0]
+        for _ in range(1, num_requests):
+            offsets.append(offsets[-1] + generator.expovariate(request_rate))
+        return offsets
+    if pattern != "fixed":
+        raise ValueError(f"Unknown arrival pattern: {pattern}")
     return [request_index / request_rate for request_index in range(num_requests)]
 
 
@@ -183,10 +346,53 @@ def deterministic_prompts(tokenizer, input_length, num_requests, seed):
     return prompts
 
 
+def parse_request_shape(value):
+    try:
+        input_length, output_length, weight = value.split(":")
+        parsed = (int(input_length), int(output_length), float(weight))
+    except (ValueError, TypeError) as error:
+        raise argparse.ArgumentTypeError(
+            "request shape must be INPUT_TOKENS:OUTPUT_TOKENS:WEIGHT"
+        ) from error
+    if parsed[0] <= 0 or parsed[1] <= 0 or parsed[2] <= 0:
+        raise argparse.ArgumentTypeError("request shape values must be positive")
+    return parsed
+
+
+def request_shapes(args):
+    shapes = args.request_shape or [
+        (args.input_length, args.output_length, 1.0)
+    ]
+    generator = random.Random(args.seed + 7919)
+    selected = generator.choices(
+        [(input_length, output_length) for input_length, output_length, _ in shapes],
+        weights=[weight for _, _, weight in shapes],
+        k=args.num_requests,
+    )
+    return (
+        [input_length for input_length, _ in selected],
+        [output_length for _, output_length in selected],
+    )
+
+
+def deterministic_mixed_prompts(tokenizer, input_lengths, seed):
+    return [
+        deterministic_prompts(tokenizer, input_length, 1, seed + index)[0]
+        for index, input_length in enumerate(input_lengths)
+    ]
+
+
 def request_metrics(record):
     if record.error or not record.token_times:
         return None
     ttft = record.token_times[0] - record.scheduled_arrival
+    submitted_at = (
+        record.submitted_at
+        if record.submitted_at is not None
+        else record.scheduled_arrival
+    )
+    queue_delay = max(0.0, submitted_at - record.scheduled_arrival)
+    engine_ttft = record.token_times[0] - submitted_at
     e2e = record.token_times[-1] - record.scheduled_arrival
     if len(record.token_times) > 1:
         intervals = [
@@ -197,7 +403,14 @@ def request_metrics(record):
     else:
         intervals = []
         tpot = 0.0
-    return {"ttft": ttft, "e2e": e2e, "tpot": tpot, "itls": intervals}
+    return {
+        "ttft": ttft,
+        "queue_delay": queue_delay,
+        "engine_ttft": engine_ttft,
+        "e2e": e2e,
+        "tpot": tpot,
+        "itls": intervals,
+    }
 
 
 def summarize_scenario(
@@ -215,10 +428,11 @@ def summarize_scenario(
     failed = []
     for record in records:
         metrics = request_metrics(record)
+        expected_output_length = record.requested_output_length or output_length
         if (
             metrics is None
-            or len(record.token_times) != output_length
-            or len(record.token_ids) != output_length
+            or len(record.token_times) != expected_output_length
+            or len(record.token_ids) != expected_output_length
         ):
             failed.append(
                 {
@@ -231,6 +445,8 @@ def summarize_scenario(
             completed.append(metrics)
 
     ttfts = [metrics["ttft"] for metrics in completed]
+    queue_delays = [metrics["queue_delay"] for metrics in completed]
+    engine_ttfts = [metrics["engine_ttft"] for metrics in completed]
     e2es = [metrics["e2e"] for metrics in completed]
     tpots = [metrics["tpot"] for metrics in completed]
     itls = [interval for metrics in completed for interval in metrics["itls"]]
@@ -253,6 +469,39 @@ def summarize_scenario(
         sum(meets_slo(metrics) for metrics in completed) if has_slo else None
     )
     generated_tokens = sum(len(record.token_times) for record in records)
+    scheduled_arrivals = sorted(record.scheduled_arrival for record in records)
+    arrival_intervals = [
+        current - previous
+        for previous, current in zip(scheduled_arrivals, scheduled_arrivals[1:])
+    ]
+    arrival_span = (
+        scheduled_arrivals[-1] - scheduled_arrivals[0]
+        if len(scheduled_arrivals) > 1
+        else 0.0
+    )
+    realized_arrival_rate = (
+        (len(scheduled_arrivals) - 1) / arrival_span if arrival_span > 0 else None
+    )
+    outstanding_events = []
+    for record in records:
+        outstanding_events.append((record.scheduled_arrival, 1))
+        if record.token_times:
+            outstanding_events.append((record.token_times[-1], -1))
+    current_outstanding = 0
+    peak_outstanding = 0
+    for _, delta in sorted(outstanding_events, key=lambda event: (event[0], event[1])):
+        current_outstanding += delta
+        peak_outstanding = max(peak_outstanding, current_outstanding)
+    if telemetry and telemetry.get("power_draw_watts"):
+        mean_power = telemetry["power_draw_watts"]["mean"]
+        estimated_energy = mean_power * duration
+        telemetry["estimated_energy_joules"] = estimated_energy
+        telemetry["estimated_joules_per_output_token"] = (
+            estimated_energy / generated_tokens if generated_tokens else None
+        )
+        telemetry["estimated_joules_per_successful_request"] = (
+            estimated_energy / len(completed) if completed else None
+        )
     raw_requests = []
     for record in records:
         metrics = request_metrics(record)
@@ -260,9 +509,18 @@ def summarize_scenario(
             {
                 "request_index": record.request_index,
                 "scheduled_arrival_seconds": record.scheduled_arrival,
+                "submitted_at_seconds": record.submitted_at,
+                "input_tokens": record.requested_input_length,
+                "requested_output_tokens": record.requested_output_length,
                 "generated_tokens": len(record.token_times),
                 "output_token_ids": record.token_ids,
                 "ttft_seconds": metrics["ttft"] if metrics else None,
+                "queue_delay_seconds": (
+                    metrics["queue_delay"] if metrics else None
+                ),
+                "engine_ttft_seconds": (
+                    metrics["engine_ttft"] if metrics else None
+                ),
                 "tpot_seconds": metrics["tpot"] if metrics else None,
                 "e2e_seconds": metrics["e2e"] if metrics else None,
                 "inter_token_seconds": metrics["itls"] if metrics else [],
@@ -274,6 +532,9 @@ def summarize_scenario(
         "engine": engine,
         "offered_request_rate": "inf" if math.isinf(request_rate) else request_rate,
         "duration_seconds": duration,
+        "realized_arrival_rate": realized_arrival_rate,
+        "arrival_interval_seconds": summarize(arrival_intervals),
+        "peak_outstanding_requests": peak_outstanding,
         "successful_requests": len(completed),
         "failed_requests": failed,
         "achieved_request_throughput": len(completed) / duration,
@@ -283,6 +544,8 @@ def summarize_scenario(
         "output_token_throughput": generated_tokens / duration,
         "generated_tokens": generated_tokens,
         "ttft_seconds": summarize(ttfts),
+        "queue_delay_seconds": summarize(queue_delays),
+        "engine_ttft_seconds": summarize(engine_ttfts),
         "tpot_seconds": summarize(tpots),
         "itl_seconds": summarize(itls),
         "e2e_seconds": summarize(e2es),
@@ -294,16 +557,32 @@ def summarize_scenario(
 def run_pagedserve_scenario(
     scheduler,
     prompts,
-    output_length,
+    output_lengths,
     request_rate,
     args,
 ):
-    offsets = arrival_offsets(request_rate, len(prompts))
-    records = [RequestRecord(index, offset) for index, offset in enumerate(offsets)]
+    offsets = arrival_offsets(
+        request_rate,
+        len(prompts),
+        pattern=args.arrival_pattern,
+        seed=args.seed,
+    )
+    records = [
+        RequestRecord(
+            index,
+            offset,
+            requested_output_length=output_lengths[index],
+            requested_input_length=len(prompts[index]),
+        )
+        for index, offset in enumerate(offsets)
+    ]
     scheduler_ids = {}
     next_request = 0
     monitor = create_monitor(args)
+    memory_profiler = TorchCUDAMemoryProfiler()
+    scheduler.kv_manager.reset_usage_stats()
     synchronize_cuda()
+    memory_profiler.start()
     monitor.start()
     benchmark_start = time.perf_counter()
 
@@ -312,8 +591,9 @@ def run_pagedserve_scenario(
         while next_request < len(prompts) and offsets[next_request] <= elapsed:
             scheduler_id = scheduler.add_token_request(
                 prompts[next_request],
-                max_new_tokens=output_length,
+                max_new_tokens=output_lengths[next_request],
             )
+            records[next_request].submitted_at = elapsed
             scheduler_ids[scheduler_id] = next_request
             next_request += 1
 
@@ -332,7 +612,9 @@ def run_pagedserve_scenario(
 
     synchronize_cuda()
     duration = time.perf_counter() - benchmark_start
-    telemetry = monitor.stop()
+    telemetry = monitor.stop() or {}
+    telemetry["torch_cuda_allocator"] = memory_profiler.stop()
+    telemetry["paged_kv_cache"] = scheduler.kv_manager.usage_summary()
     return records, duration, telemetry
 
 
@@ -360,26 +642,43 @@ def hf_generate_one(model, prompt, output_length, record, benchmark_start):
             record.token_ids.append(int(next_token.item()))
 
 
-def run_hf_scenario(model, prompts, output_length, request_rate, args):
-    offsets = arrival_offsets(request_rate, len(prompts))
-    records = [RequestRecord(index, offset) for index, offset in enumerate(offsets)]
+def run_hf_scenario(model, prompts, output_lengths, request_rate, args):
+    offsets = arrival_offsets(
+        request_rate,
+        len(prompts),
+        pattern=args.arrival_pattern,
+        seed=args.seed,
+    )
+    records = [
+        RequestRecord(
+            index,
+            offset,
+            requested_output_length=output_lengths[index],
+            requested_input_length=len(prompts[index]),
+        )
+        for index, offset in enumerate(offsets)
+    ]
     monitor = create_monitor(args)
+    memory_profiler = TorchCUDAMemoryProfiler()
     synchronize_cuda()
+    memory_profiler.start()
     monitor.start()
     benchmark_start = time.perf_counter()
 
-    for prompt, record in zip(prompts, records):
+    for prompt, output_length, record in zip(prompts, output_lengths, records):
         wait_for = record.scheduled_arrival - (time.perf_counter() - benchmark_start)
         if wait_for > 0:
             time.sleep(wait_for)
         try:
+            record.submitted_at = time.perf_counter() - benchmark_start
             hf_generate_one(model, prompt, output_length, record, benchmark_start)
         except Exception as error:
             record.error = f"{type(error).__name__}: {error}"
 
     synchronize_cuda()
     duration = time.perf_counter() - benchmark_start
-    telemetry = monitor.stop()
+    telemetry = monitor.stop() or {}
+    telemetry["torch_cuda_allocator"] = memory_profiler.stop()
     return records, duration, telemetry
 
 
@@ -394,6 +693,7 @@ async def consume_vllm_request(
     if wait_for > 0:
         await asyncio.sleep(wait_for)
     try:
+        record.submitted_at = time.perf_counter() - benchmark_start
         async for output in engine.generate(
             request_id=f"benchmark-{record.request_index}-{benchmark_start}",
             prompt={"prompt_token_ids": prompt},
@@ -413,40 +713,59 @@ async def consume_vllm_request(
 async def run_vllm_scenario(
     engine,
     prompts,
-    output_length,
+    output_lengths,
     request_rate,
     args,
 ):
     from vllm import SamplingParams
     from vllm.sampling_params import RequestOutputKind
 
-    offsets = arrival_offsets(request_rate, len(prompts))
-    records = [RequestRecord(index, offset) for index, offset in enumerate(offsets)]
-    sampling_params = SamplingParams(
-        temperature=0.0,
-        max_tokens=output_length,
-        ignore_eos=True,
-        output_kind=RequestOutputKind.DELTA,
+    offsets = arrival_offsets(
+        request_rate,
+        len(prompts),
+        pattern=args.arrival_pattern,
+        seed=args.seed,
     )
+    records = [
+        RequestRecord(
+            index,
+            offset,
+            requested_output_length=output_lengths[index],
+            requested_input_length=len(prompts[index]),
+        )
+        for index, offset in enumerate(offsets)
+    ]
     monitor = create_monitor(args)
+    memory_profiler = TorchCUDAMemoryProfiler()
     synchronize_cuda()
+    memory_profiler.start()
     monitor.start()
     benchmark_start = time.perf_counter()
     await asyncio.gather(
         *[
             consume_vllm_request(
                 engine,
-                sampling_params,
+                SamplingParams(
+                    temperature=0.0,
+                    max_tokens=output_length,
+                    ignore_eos=True,
+                    output_kind=RequestOutputKind.DELTA,
+                ),
                 prompt,
                 record,
                 benchmark_start,
             )
-            for prompt, record in zip(prompts, records)
+            for prompt, output_length, record in zip(
+                prompts,
+                output_lengths,
+                records,
+            )
         ]
     )
     synchronize_cuda()
     duration = time.perf_counter() - benchmark_start
-    telemetry = monitor.stop()
+    telemetry = monitor.stop() or {}
+    telemetry["torch_cuda_allocator"] = memory_profiler.stop()
     return records, duration, telemetry
 
 
@@ -556,6 +875,18 @@ def parse_args():
     parser.add_argument("--output-length", type=positive_integer, required=True)
     parser.add_argument("--num-requests", type=positive_integer, default=100)
     parser.add_argument(
+        "--arrival-pattern",
+        choices=("fixed", "poisson"),
+        default="fixed",
+        help="fixed intervals for controlled tests or Poisson arrivals for production-like load",
+    )
+    parser.add_argument(
+        "--request-shape",
+        type=parse_request_shape,
+        action="append",
+        help="repeat INPUT_TOKENS:OUTPUT_TOKENS:WEIGHT for a mixed workload",
+    )
+    parser.add_argument(
         "--request-rate",
         type=parse_request_rate,
         action="append",
@@ -601,28 +932,58 @@ def validate_args(args):
         raise RuntimeError("The vLLM comparison requires a supported GPU environment")
     if not torch.cuda.is_available() and args.dtype != "float32":
         raise ValueError("CPU comparison runs must use float32")
-    if args.input_length + args.output_length > args.max_model_len:
-        raise ValueError("input_length + output_length exceeds max_model_len")
+    shapes = args.request_shape or [(args.input_length, args.output_length, 1.0)]
+    if any(input_length + output_length > args.max_model_len for input_length, output_length, _ in shapes):
+        raise ValueError("a request shape exceeds max_model_len")
     if not 0 < args.gpu_memory_utilization <= 1:
         raise ValueError("gpu_memory_utilization must be in (0, 1]")
     if not 0 < args.kv_cache_memory_utilization <= 1:
         raise ValueError("kv_cache_memory_utilization must be in (0, 1]")
 
 
-def base_report(args):
+def base_report(args, input_lengths, output_lengths):
     return {
+        "profile_schema_version": 3,
         "system": system_metadata(),
+        "gpu_lifecycle": {
+            "before_engine_initialization": nvidia_smi_snapshot(),
+        },
         "settings": {
             "engine": args.engine,
             "model_id": args.model_id,
             "dtype": args.dtype,
             "input_length": args.input_length,
             "output_length": args.output_length,
+            "total_sequence_length": args.input_length + args.output_length,
+            "actual_total_sequence_length_tokens": summarize(
+                [
+                    input_length + output_length
+                    for input_length, output_length in zip(
+                        input_lengths,
+                        output_lengths,
+                    )
+                ]
+            ),
             "num_requests": args.num_requests,
+            "total_prompt_tokens": sum(input_lengths),
+            "requested_output_tokens": sum(output_lengths),
+            "actual_input_length_tokens": summarize(input_lengths),
+            "actual_output_length_tokens": summarize(output_lengths),
+            "request_shapes": [
+                {
+                    "input_tokens": input_length,
+                    "output_tokens": output_length,
+                    "weight": weight,
+                }
+                for input_length, output_length, weight in (
+                    args.request_shape
+                    or [(args.input_length, args.output_length, 1.0)]
+                )
+            ],
             "request_rates": [
                 "inf" if math.isinf(rate) else rate for rate in args.request_rate
             ],
-            "arrival_pattern": "fixed_interval_open_loop",
+            "arrival_pattern": f"{args.arrival_pattern}_open_loop",
             "seed": args.seed,
             "max_model_len": args.max_model_len,
             "max_batch_size": args.max_batch_size,
@@ -657,7 +1018,8 @@ def add_summary(report, args, request_rate, records, duration, telemetry):
     )
 
 
-def run_pagedserve(args, tokenizer, prompts, report):
+def run_pagedserve(args, tokenizer, prompts, output_lengths, report):
+    initialization_start = time.perf_counter()
     scheduler = build_scheduler(
         GPT2_MODEL,
         gpt2_model_id=args.model_id,
@@ -669,12 +1031,23 @@ def run_pagedserve(args, tokenizer, prompts, report):
         kv_cache_safety_mb=args.kv_cache_safety_mb,
         execution_dtype=args.dtype,
     )
+    synchronize_cuda()
+    initialization_seconds = time.perf_counter() - initialization_start
+    report["gpu_lifecycle"]["after_engine_initialization"] = nvidia_smi_snapshot()
     scheduler.eos_token_id = None
-    warmup_pagedserve(scheduler, prompts[0], args.output_length)
+    warmup_start = time.perf_counter()
+    warmup_pagedserve(scheduler, prompts[0], output_lengths[0])
+    warmup_seconds = time.perf_counter() - warmup_start
+    report["gpu_lifecycle"]["after_warmup"] = nvidia_smi_snapshot()
     report["engine_metadata"] = {
         "policy": "continuous_batching",
         "model_dtype": str(next(scheduler.model_engine.parameters()).dtype),
+        "initialization_seconds": initialization_seconds,
+        "warmup_seconds": warmup_seconds,
+        "module_memory": module_memory_profile(scheduler.model_engine),
         "model_parameter_bytes": scheduler.kv_manager.model_parameter_bytes,
+        "model_parameter_count": scheduler.kv_manager.model_parameter_count,
+        "model_buffer_bytes": scheduler.kv_manager.model_buffer_bytes,
         "kv_cache_memory_bytes": scheduler.kv_manager.total_memory,
         "kv_cache_memory_source": scheduler.kv_manager.memory_budget_source,
         "kv_cache_blocks": scheduler.kv_manager.total_available_blocks,
@@ -692,48 +1065,62 @@ def run_pagedserve(args, tokenizer, prompts, report):
             // math.ceil(args.max_model_len / scheduler.kv_manager.block_size)
         ),
         "cuda_memory_snapshot": scheduler.kv_manager.cuda_memory_snapshot,
+        "cuda_allocator_snapshots": (
+            scheduler.kv_manager.cuda_allocator_snapshots
+        ),
     }
     for request_rate in args.request_rate:
         records, duration, telemetry = run_pagedserve_scenario(
             scheduler,
             prompts,
-            args.output_length,
+            output_lengths,
             request_rate,
             args,
         )
         add_summary(report, args, request_rate, records, duration, telemetry)
 
 
-def run_hf(args, tokenizer, prompts, report):
+def run_hf(args, tokenizer, prompts, output_lengths, report):
     import transformers
     from transformers import AutoModelForCausalLM
 
+    initialization_start = time.perf_counter()
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         dtype=torch_dtype(args.dtype),
     ).to("cuda" if torch.cuda.is_available() else "cpu").eval()
-    warmup_hf(model, prompts[0], args.output_length)
+    synchronize_cuda()
+    initialization_seconds = time.perf_counter() - initialization_start
+    report["gpu_lifecycle"]["after_engine_initialization"] = nvidia_smi_snapshot()
+    warmup_start = time.perf_counter()
+    warmup_hf(model, prompts[0], output_lengths[0])
+    warmup_seconds = time.perf_counter() - warmup_start
+    report["gpu_lifecycle"]["after_warmup"] = nvidia_smi_snapshot()
     report["engine_metadata"] = {
         "policy": "sequential_fcfs_no_continuous_batching",
         "transformers_version": transformers.__version__,
         "model_dtype": str(next(model.parameters()).dtype),
+        "initialization_seconds": initialization_seconds,
+        "warmup_seconds": warmup_seconds,
+        "module_memory": module_memory_profile(model),
     }
     for request_rate in args.request_rate:
         records, duration, telemetry = run_hf_scenario(
             model,
             prompts,
-            args.output_length,
+            output_lengths,
             request_rate,
             args,
         )
         add_summary(report, args, request_rate, records, duration, telemetry)
 
 
-async def run_vllm(args, prompts, report):
+async def run_vllm(args, prompts, output_lengths, report):
     import vllm
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
 
+    initialization_start = time.perf_counter()
     engine_args = AsyncEngineArgs(
         model=args.model_id,
         dtype=args.dtype,
@@ -746,17 +1133,47 @@ async def run_vllm(args, prompts, report):
         seed=args.seed,
     )
     engine = AsyncLLM.from_engine_args(engine_args)
+    initialization_seconds = time.perf_counter() - initialization_start
+    report["gpu_lifecycle"]["after_engine_initialization"] = nvidia_smi_snapshot()
+    cache_config = getattr(getattr(engine, "vllm_config", None), "cache_config", None)
+    cache_dtype = getattr(cache_config, "cache_dtype", None)
     report["engine_metadata"] = {
         "policy": "vllm_async_continuous_batching",
         "vllm_version": vllm.__version__,
+        "initialization_seconds": initialization_seconds,
+        "vllm_cache_config": {
+            "block_size_tokens": getattr(cache_config, "block_size", None),
+            "kv_cache_memory_bytes": getattr(
+                cache_config,
+                "kv_cache_memory_bytes",
+                None,
+            ),
+            "kv_cache_size_tokens": getattr(
+                cache_config,
+                "kv_cache_size_tokens",
+                None,
+            ),
+            "kv_cache_max_concurrency": getattr(
+                cache_config,
+                "kv_cache_max_concurrency",
+                None,
+            ),
+            "num_gpu_blocks": getattr(cache_config, "num_gpu_blocks", None),
+            "kv_cache_dtype": str(cache_dtype) if cache_dtype is not None else None,
+        },
     }
     try:
-        await warmup_vllm(engine, prompts[0], args.output_length)
+        warmup_start = time.perf_counter()
+        await warmup_vllm(engine, prompts[0], output_lengths[0])
+        report["engine_metadata"]["warmup_seconds"] = (
+            time.perf_counter() - warmup_start
+        )
+        report["gpu_lifecycle"]["after_warmup"] = nvidia_smi_snapshot()
         for request_rate in args.request_rate:
             records, duration, telemetry = await run_vllm_scenario(
                 engine,
                 prompts,
-                args.output_length,
+                output_lengths,
                 request_rate,
                 args,
             )
@@ -776,7 +1193,25 @@ def print_report(report):
         f"dtype {report['settings']['dtype']} | "
         f"vLLM {report['engine_metadata'].get('vllm_version', 'n/a')}"
     )
+    model_metadata = report["model_metadata"]
+    model_config = model_metadata["config"]
+    parameter_count = model_metadata["theoretical_parameter_count"]
+    print(
+        f"Architecture: {model_config['model_type']} | "
+        f"parameters {parameter_count if parameter_count is not None else 'n/a'} | "
+        f"runtime weight bytes "
+        f"{model_metadata['theoretical_runtime_weight_bytes']} | "
+        f"layers/heads/KV-heads "
+        f"{model_config['num_layers']}/{model_config['num_attention_heads']}/"
+        f"{model_config['num_key_value_heads']} | hidden "
+        f"{model_config['hidden_size']} | context "
+        f"{model_config['max_position_embeddings']}"
+    )
     engine_metadata = report["engine_metadata"]
+    print(
+        f"Engine initialization: {engine_metadata['initialization_seconds']:.3f} s | "
+        f"warmup: {engine_metadata.get('warmup_seconds', float('nan')):.3f} s"
+    )
     if "kv_cache_memory_bytes" in engine_metadata:
         print(
             f"PagedServe memory: model parameters "
@@ -789,14 +1224,19 @@ def print_report(report):
         )
     print(
         "engine | offered RPS | achieved RPS | goodput RPS | output tok/s | "
-        "TTFT p50/p95 (ms) | TPOT p50/p95 (ms) | E2E p50/p95 (ms) | failures"
+        "TTFT p50/p95/p99 (ms) | TPOT p50/p95/p99 (ms) | "
+        "E2E p50/p95/p99 (ms) | failures"
     )
     print("-" * 145)
 
-    def latency_pair(summary):
+    def latency_triplet(summary):
         if summary is None:
             return "n/a"
-        return f"{summary['median'] * 1000:.2f}/{summary['p95'] * 1000:.2f}"
+        return (
+            f"{summary['median'] * 1000:.2f}/"
+            f"{summary['p95'] * 1000:.2f}/"
+            f"{summary['p99'] * 1000:.2f}"
+        )
 
     for result in report["results"]:
         ttft = result["ttft_seconds"]
@@ -809,10 +1249,22 @@ def print_report(report):
             f"{result['achieved_request_throughput']:.3f} | "
             f"{goodput_text} | "
             f"{result['output_token_throughput']:.2f} | "
-            f"{latency_pair(ttft)} | "
-            f"{latency_pair(tpot)} | "
-            f"{latency_pair(e2e)} | "
+            f"{latency_triplet(ttft)} | "
+            f"{latency_triplet(tpot)} | "
+            f"{latency_triplet(e2e)} | "
             f"{len(result['failed_requests'])}"
+        )
+        print(
+            f"  queue delay p50/p95/p99: "
+            f"{latency_triplet(result['queue_delay_seconds'])} ms | "
+            f"engine TTFT after submit: "
+            f"{latency_triplet(result['engine_ttft_seconds'])} ms"
+        )
+        realized_rate = result["realized_arrival_rate"]
+        realized_text = "burst" if realized_rate is None else f"{realized_rate:.3f}"
+        print(
+            f"  realized arrivals: {realized_text} RPS | "
+            f"peak outstanding requests: {result['peak_outstanding_requests']}"
         )
 
     for result in report["results"]:
@@ -831,40 +1283,86 @@ def print_report(report):
             f"memory activity mean/p95/max={memory_activity['mean']:.1f}/"
             f"{memory_activity['p95']:.1f}/{memory_activity['maximum']:.1f}% | "
             f"VRAM mean/max={used_memory['mean']:.0f}/"
-            f"{used_memory['maximum']:.0f} MiB of {total_memory:.0f} MiB"
+            f"{used_memory['maximum']:.0f} MiB of {total_memory:.0f} MiB | "
+            f"power mean/max={telemetry['power_draw_watts']['mean']:.1f}/"
+            f"{telemetry['power_draw_watts']['maximum']:.1f} W | "
+            f"energy~{telemetry.get('estimated_energy_joules', float('nan')):.1f} J"
         )
+        kv_usage = telemetry.get("paged_kv_cache")
+        if kv_usage:
+            print(
+                f"  Paged KV peak: {kv_usage['peak_allocated_blocks']:,}/"
+                f"{kv_usage['total_blocks']:,} blocks, "
+                f"{kv_usage['peak_allocated_tokens']:,} tokens, "
+                f"{kv_usage['peak_allocated_bytes'] / (1024 ** 2):.1f} MiB, "
+                f"{kv_usage['peak_utilization_percent']:.2f}%"
+            )
+        allocator = telemetry.get("torch_cuda_allocator")
+        if allocator:
+            print(
+                f"  Torch CUDA peak allocated/reserved: "
+                f"{allocator['peak_allocated_bytes'] / (1024 ** 2):.1f}/"
+                f"{allocator['peak_reserved_bytes'] / (1024 ** 2):.1f} MiB"
+            )
 
 
 def main():
     args = parse_args()
     validate_args(args)
 
-    from transformers import AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+    tokenizer_start = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    prompts = deterministic_prompts(
-        tokenizer,
-        args.input_length,
-        args.num_requests,
-        args.seed,
-    )
-    report = base_report(args)
+    tokenizer_load_seconds = time.perf_counter() - tokenizer_start
+    config_start = time.perf_counter()
+    model_config = AutoConfig.from_pretrained(args.model_id)
+    config_load_seconds = time.perf_counter() - config_start
+    theoretical_parameter_count = None
+    parameter_count_error = None
+    try:
+        with torch.device("meta"):
+            meta_model = AutoModelForCausalLM.from_config(model_config)
+        theoretical_parameter_count = sum(
+            parameter.numel() for parameter in meta_model.parameters()
+        )
+        del meta_model
+    except Exception as error:
+        parameter_count_error = f"{type(error).__name__}: {error}"
+    input_lengths, output_lengths = request_shapes(args)
+    prompts = deterministic_mixed_prompts(tokenizer, input_lengths, args.seed)
+    report = base_report(args, input_lengths, output_lengths)
     prompt_digest = hashlib.sha256(
         json.dumps(prompts, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     report["model_metadata"] = {
         "tokenizer_class": type(tokenizer).__name__,
         "tokenizer_commit": tokenizer.init_kwargs.get("_commit_hash"),
+        "model_config_commit": getattr(model_config, "_commit_hash", None),
         "vocab_size": len(tokenizer),
         "prompt_token_ids_sha256": prompt_digest,
+        "tokenizer_load_seconds": tokenizer_load_seconds,
+        "config_load_seconds": config_load_seconds,
+        "config": config_profile(model_config),
+        "theoretical_parameter_count": theoretical_parameter_count,
+        "theoretical_runtime_weight_bytes": (
+            theoretical_parameter_count
+            * torch.empty(0, dtype=torch_dtype(args.dtype)).element_size()
+            if theoretical_parameter_count is not None
+            else None
+        ),
+        "parameter_count_error": parameter_count_error,
     }
     if args.engine == "pagedserve":
-        run_pagedserve(args, tokenizer, prompts, report)
+        run_pagedserve(args, tokenizer, prompts, output_lengths, report)
     elif args.engine == "hf":
-        run_hf(args, tokenizer, prompts, report)
+        run_hf(args, tokenizer, prompts, output_lengths, report)
     else:
-        asyncio.run(run_vllm(args, prompts, report))
+        asyncio.run(run_vllm(args, prompts, output_lengths, report))
 
+    report["model_metadata"]["huggingface_cache_after_run"] = (
+        huggingface_cache_profile(args.model_id)
+    )
     print_report(report)
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
     args.json_output.write_text(json.dumps(report, indent=2) + "\n")
