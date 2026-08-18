@@ -276,6 +276,37 @@ def config_profile(config):
     }
 
 
+def causal_lm_from_config(config):
+    """Instantiate GPT-2 directly to avoid fragile lazy AutoModel resolution."""
+    if getattr(config, "model_type", None) == "gpt2":
+        from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
+
+        return GPT2LMHeadModel(config)
+
+    from transformers import AutoModelForCausalLM
+
+    return AutoModelForCausalLM.from_config(config)
+
+
+def causal_lm_from_pretrained(model_id, config, dtype):
+    if getattr(config, "model_type", None) == "gpt2":
+        from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
+
+        return GPT2LMHeadModel.from_pretrained(
+            model_id,
+            config=config,
+            dtype=dtype,
+        )
+
+    from transformers import AutoModelForCausalLM
+
+    return AutoModelForCausalLM.from_pretrained(
+        model_id,
+        config=config,
+        dtype=dtype,
+    )
+
+
 def huggingface_cache_profile(model_id):
     try:
         from huggingface_hub import scan_cache_dir
@@ -1080,14 +1111,14 @@ def run_pagedserve(args, tokenizer, prompts, output_lengths, report):
         add_summary(report, args, request_rate, records, duration, telemetry)
 
 
-def run_hf(args, tokenizer, prompts, output_lengths, report):
+def run_hf(args, tokenizer, model_config, prompts, output_lengths, report):
     import transformers
-    from transformers import AutoModelForCausalLM
 
     initialization_start = time.perf_counter()
-    model = AutoModelForCausalLM.from_pretrained(
+    model = causal_lm_from_pretrained(
         args.model_id,
-        dtype=torch_dtype(args.dtype),
+        model_config,
+        torch_dtype(args.dtype),
     ).to("cuda" if torch.cuda.is_available() else "cpu").eval()
     synchronize_cuda()
     initialization_seconds = time.perf_counter() - initialization_start
@@ -1310,7 +1341,7 @@ def main():
     args = parse_args()
     validate_args(args)
 
-    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoTokenizer
 
     tokenizer_start = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
@@ -1322,7 +1353,7 @@ def main():
     parameter_count_error = None
     try:
         with torch.device("meta"):
-            meta_model = AutoModelForCausalLM.from_config(model_config)
+            meta_model = causal_lm_from_config(model_config)
         theoretical_parameter_count = sum(
             parameter.numel() for parameter in meta_model.parameters()
         )
@@ -1356,7 +1387,14 @@ def main():
     if args.engine == "pagedserve":
         run_pagedserve(args, tokenizer, prompts, output_lengths, report)
     elif args.engine == "hf":
-        run_hf(args, tokenizer, prompts, output_lengths, report)
+        run_hf(
+            args,
+            tokenizer,
+            model_config,
+            prompts,
+            output_lengths,
+            report,
+        )
     else:
         asyncio.run(run_vllm(args, prompts, output_lengths, report))
 

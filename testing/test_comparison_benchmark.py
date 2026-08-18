@@ -3,9 +3,12 @@ import math
 import time
 from types import SimpleNamespace
 
+import torch
+
 from comparison_benchmark import (
     RequestRecord,
     arrival_offsets,
+    causal_lm_from_config,
     consume_vllm_request,
     create_monitor,
     deterministic_prompts,
@@ -20,6 +23,22 @@ class DummyTokenizer:
 
     def __len__(self):
         return 32
+
+
+def test_gpt2_model_instantiation_bypasses_auto_model_lookup():
+    from transformers import GPT2Config
+    from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
+
+    config = GPT2Config(
+        vocab_size=32,
+        n_positions=16,
+        n_embd=16,
+        n_layer=1,
+        n_head=2,
+    )
+    with torch.device("meta"):
+        model = causal_lm_from_config(config)
+    assert isinstance(model, GPT2LMHeadModel)
 
 
 def test_deterministic_prompt_tokens_are_exact_and_repeatable():
