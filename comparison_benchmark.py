@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import platform
 import random
 import statistics
@@ -42,14 +43,16 @@ class RequestRecord:
 class NvidiaSMIMonitor:
     """Sample whole-device telemetry while only the measured workload runs."""
 
-    def __init__(self, interval_ms=200):
+    def __init__(self, interval_ms=200, gpu_id="0"):
         self.interval_ms = interval_ms
+        self.gpu_id = gpu_id
         self.process = None
 
     def start(self):
         self.process = subprocess.Popen(
             [
                 "nvidia-smi",
+                f"--id={self.gpu_id}",
                 "--query-gpu=utilization.gpu,utilization.memory,"
                 "memory.used,memory.total,power.draw,power.limit",
                 "--format=csv,noheader,nounits",
@@ -109,7 +112,9 @@ class NullMonitor:
 
 def create_monitor(args):
     if torch.cuda.is_available():
-        return NvidiaSMIMonitor(args.telemetry_interval_ms)
+        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+        physical_gpu = visible_devices.split(",", maxsplit=1)[0].strip() or "0"
+        return NvidiaSMIMonitor(args.telemetry_interval_ms, gpu_id=physical_gpu)
     return NullMonitor()
 
 

@@ -7,6 +7,7 @@ from comparison_benchmark import (
     RequestRecord,
     arrival_offsets,
     consume_vllm_request,
+    create_monitor,
     deterministic_prompts,
     request_metrics,
     summarize_scenario,
@@ -94,3 +95,10 @@ def test_vllm_delta_stream_records_each_generated_token_once():
     assert record.error is None
     assert record.token_ids == [20, 21, 22]
     assert len(record.token_times) == 3
+
+
+def test_gpu_monitor_targets_only_the_first_cuda_visible_device(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1,0")
+    monkeypatch.setattr("comparison_benchmark.torch.cuda.is_available", lambda: True)
+    monitor = create_monitor(SimpleNamespace(telemetry_interval_ms=200))
+    assert monitor.gpu_id == "1"
