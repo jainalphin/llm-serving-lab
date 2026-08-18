@@ -73,14 +73,24 @@ def test_kv_cache_usage_summary_tracks_peak_and_capacity():
     assert summary["peak_utilization_percent"] == 50
 
 
-def test_scheduler_records_memory_profile_metadata_on_cpu():
+def test_scheduler_records_memory_profile_metadata():
     scheduler = build_scheduler(REFERENCE_MODEL)
     manager = scheduler.kv_manager
     assert manager.model_parameter_count > 0
     assert manager.model_parameter_bytes > 0
     assert manager.model_buffer_bytes >= 0
-    assert manager.cuda_allocator_snapshots == {
-        "before_model": None,
-        "after_model": None,
-        "after_kv_cache": None,
+    snapshots = manager.cuda_allocator_snapshots
+    assert set(snapshots) == {
+        "before_model",
+        "after_model",
+        "after_kv_cache",
     }
+    if torch.cuda.is_available():
+        for snapshot in snapshots.values():
+            assert snapshot["total_bytes"] > 0
+            assert snapshot["free_bytes"] >= 0
+            assert snapshot["device_used_bytes"] >= 0
+            assert snapshot["torch_allocated_bytes"] >= 0
+            assert snapshot["torch_reserved_bytes"] >= 0
+    else:
+        assert all(snapshot is None for snapshot in snapshots.values())
