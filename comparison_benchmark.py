@@ -25,7 +25,13 @@ from pathlib import Path
 import torch
 
 from benchmark import positive_integer
-from main import GPT2_MODEL, SUPPORTED_DTYPES, build_scheduler
+from main import (
+    DEFAULT_CUDA_KV_MEMORY_UTILIZATION,
+    DEFAULT_CUDA_KV_SAFETY_MB,
+    GPT2_MODEL,
+    SUPPORTED_DTYPES,
+    build_scheduler,
+)
 
 
 SUPPORTED_ENGINES = ("hf", "pagedserve", "vllm")
@@ -239,7 +245,13 @@ def summarize_scenario(
             checks.append(metrics["e2e"] * 1000 <= e2e_slo_ms)
         return all(checks)
 
-    good_requests = sum(meets_slo(metrics) for metrics in completed)
+    has_slo = any(
+        value is not None
+        for value in (ttft_slo_ms, tpot_slo_ms, e2e_slo_ms)
+    )
+    good_requests = (
+        sum(meets_slo(metrics) for metrics in completed) if has_slo else None
+    )
     generated_tokens = sum(len(record.token_times) for record in records)
     raw_requests = []
     for record in records:
@@ -265,7 +277,9 @@ def summarize_scenario(
         "successful_requests": len(completed),
         "failed_requests": failed,
         "achieved_request_throughput": len(completed) / duration,
-        "goodput_requests_per_second": good_requests / duration,
+        "goodput_requests_per_second": (
+            good_requests / duration if good_requests is not None else None
+        ),
         "output_token_throughput": generated_tokens / duration,
         "generated_tokens": generated_tokens,
         "ttft_seconds": summarize(ttfts),
@@ -551,7 +565,21 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--max-model-len", type=positive_integer, default=1024)
     parser.add_argument("--max-batch-size", type=positive_integer, default=64)
-    parser.add_argument("--kv-cache-memory-mb", type=positive_integer, default=6144)
+    parser.add_argument(
+        "--kv-cache-memory-mb",
+        type=positive_integer,
+        help="explicit PagedServe KV budget; omit for safe automatic CUDA sizing",
+    )
+    parser.add_argument(
+        "--kv-cache-memory-utilization",
+        type=float,
+        default=DEFAULT_CUDA_KV_MEMORY_UTILIZATION,
+    )
+    parser.add_argument(
+        "--kv-cache-safety-mb",
+        type=positive_integer,
+        default=DEFAULT_CUDA_KV_SAFETY_MB,
+    )
     parser.add_argument("--prefill-chunk-size", type=positive_integer, default=128)
     parser.add_argument(
         "--pagedserve-strategy",
@@ -577,6 +605,8 @@ def validate_args(args):
         raise ValueError("input_length + output_length exceeds max_model_len")
     if not 0 < args.gpu_memory_utilization <= 1:
         raise ValueError("gpu_memory_utilization must be in (0, 1]")
+    if not 0 < args.kv_cache_memory_utilization <= 1:
+        raise ValueError("kv_cache_memory_utilization must be in (0, 1]")
 
 
 def base_report(args):
@@ -597,6 +627,8 @@ def base_report(args):
             "max_model_len": args.max_model_len,
             "max_batch_size": args.max_batch_size,
             "kv_cache_memory_mb": args.kv_cache_memory_mb,
+            "kv_cache_memory_utilization": args.kv_cache_memory_utilization,
+            "kv_cache_safety_mb": args.kv_cache_safety_mb,
             "prefill_chunk_size": args.prefill_chunk_size,
             "pagedserve_strategy": args.pagedserve_strategy,
             "gpu_memory_utilization": args.gpu_memory_utilization,
@@ -633,6 +665,8 @@ def run_pagedserve(args, tokenizer, prompts, report):
         prefill_chunk_size=args.prefill_chunk_size,
         max_batch_size=args.max_batch_size,
         kv_cache_memory_mb=args.kv_cache_memory_mb,
+        kv_cache_memory_utilization=args.kv_cache_memory_utilization,
+        kv_cache_safety_mb=args.kv_cache_safety_mb,
         execution_dtype=args.dtype,
     )
     scheduler.eos_token_id = None
@@ -640,7 +674,24 @@ def run_pagedserve(args, tokenizer, prompts, report):
     report["engine_metadata"] = {
         "policy": "continuous_batching",
         "model_dtype": str(next(scheduler.model_engine.parameters()).dtype),
+        "model_parameter_bytes": scheduler.kv_manager.model_parameter_bytes,
+        "kv_cache_memory_bytes": scheduler.kv_manager.total_memory,
+        "kv_cache_memory_source": scheduler.kv_manager.memory_budget_source,
         "kv_cache_blocks": scheduler.kv_manager.total_available_blocks,
+        "kv_cache_block_size_tokens": scheduler.kv_manager.block_size,
+        "kv_cache_bytes_per_token": (
+            scheduler.kv_manager.bytes_per_block
+            // scheduler.kv_manager.block_size
+        ),
+        "kv_cache_capacity_tokens": (
+            scheduler.kv_manager.total_available_blocks
+            * scheduler.kv_manager.block_size
+        ),
+        "kv_cache_capacity_max_length_requests": (
+            scheduler.kv_manager.total_available_blocks
+            // math.ceil(args.max_model_len / scheduler.kv_manager.block_size)
+        ),
+        "cuda_memory_snapshot": scheduler.kv_manager.cuda_memory_snapshot,
     }
     for request_rate in args.request_rate:
         records, duration, telemetry = run_pagedserve_scenario(
@@ -725,6 +776,17 @@ def print_report(report):
         f"dtype {report['settings']['dtype']} | "
         f"vLLM {report['engine_metadata'].get('vllm_version', 'n/a')}"
     )
+    engine_metadata = report["engine_metadata"]
+    if "kv_cache_memory_bytes" in engine_metadata:
+        print(
+            f"PagedServe memory: model parameters "
+            f"{engine_metadata['model_parameter_bytes'] / (1024 ** 2):.1f} MiB | "
+            f"KV cache {engine_metadata['kv_cache_memory_bytes'] / (1024 ** 2):.1f} MiB "
+            f"({engine_metadata['kv_cache_memory_source']}) | "
+            f"KV capacity {engine_metadata['kv_cache_capacity_tokens']:,} tokens / "
+            f"{engine_metadata['kv_cache_capacity_max_length_requests']:,} "
+            f"max-length requests"
+        )
     print(
         "engine | offered RPS | achieved RPS | goodput RPS | output tok/s | "
         "TTFT p50/p95 (ms) | TPOT p50/p95 (ms) | E2E p50/p95 (ms) | failures"
@@ -740,10 +802,12 @@ def print_report(report):
         ttft = result["ttft_seconds"]
         tpot = result["tpot_seconds"]
         e2e = result["e2e_seconds"]
+        goodput = result["goodput_requests_per_second"]
+        goodput_text = "n/a" if goodput is None else f"{goodput:.3f}"
         print(
             f"{result['engine']} | {result['offered_request_rate']} | "
             f"{result['achieved_request_throughput']:.3f} | "
-            f"{result['goodput_requests_per_second']:.3f} | "
+            f"{goodput_text} | "
             f"{result['output_token_throughput']:.2f} | "
             f"{latency_pair(ttft)} | "
             f"{latency_pair(tpot)} | "

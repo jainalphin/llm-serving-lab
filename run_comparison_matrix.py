@@ -19,6 +19,11 @@ PROFILES = {
         "rates": (1, 2, 4, 8, 16, 32, "inf"),
         "num_requests": 100,
     },
+    "capacity": {
+        "scenarios": ((128, 32), (900, 64)),
+        "rates": (4, 8, 12, 16, 24, 32, 40, 50, 60, 70, 80),
+        "num_requests": 120,
+    },
 }
 
 ENGINE_CONFIGS = (
@@ -27,12 +32,24 @@ ENGINE_CONFIGS = (
     ("pagedserve", "sarathi"),
     ("vllm", None),
 )
+ENGINE_LABELS = {
+    "hf": ("hf", None),
+    "pagedserve-orca": ("pagedserve", "orca"),
+    "pagedserve-sarathi": ("pagedserve", "sarathi"),
+    "vllm": ("vllm", None),
+}
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", choices=PROFILES, default="quick")
     parser.add_argument("--dtype", action="append", choices=("float32", "float16"))
+    parser.add_argument(
+        "--engine",
+        action="append",
+        choices=ENGINE_LABELS,
+        help="engine to run; repeat to select multiple (default: all)",
+    )
     parser.add_argument("--num-requests", type=int)
     parser.add_argument("--output-dir", type=Path, default=Path("benchmarks/comparison"))
     parser.add_argument("--ttft-slo-ms", type=float)
@@ -47,6 +64,11 @@ def main():
     profile = PROFILES[args.profile]
     dtypes = args.dtype or ["float32"]
     num_requests = args.num_requests or profile["num_requests"]
+    engine_configs = (
+        [ENGINE_LABELS[label] for label in args.engine]
+        if args.engine
+        else ENGINE_CONFIGS
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest = {
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -58,7 +80,7 @@ def main():
 
     for dtype in dtypes:
         for input_length, output_length in profile["scenarios"]:
-            for engine, strategy in ENGINE_CONFIGS:
+            for engine, strategy in engine_configs:
                 label = engine if strategy is None else f"{engine}_{strategy}"
                 output_path = args.output_dir / (
                     f"{label}_{dtype}_in{input_length}_out{output_length}.json"

@@ -23,6 +23,37 @@ DISTILGPT2_MODEL = "distilgpt2"
 GPT2_MODEL = "gpt2"
 SUPPORTED_MODELS = (REFERENCE_MODEL, DISTILGPT2_MODEL, GPT2_MODEL)
 SUPPORTED_DTYPES = ("float32", "float16", "bfloat16")
+MIB = 1024 * 1024
+DEFAULT_CUDA_KV_MEMORY_UTILIZATION = 0.90
+DEFAULT_CUDA_KV_SAFETY_MB = 3072
+
+
+def calculate_cuda_kv_cache_budget(
+    free_memory,
+    total_memory,
+    memory_utilization=DEFAULT_CUDA_KV_MEMORY_UTILIZATION,
+    safety_memory=DEFAULT_CUDA_KV_SAFETY_MB * MIB,
+):
+    """Choose a KV budget without treating all currently free VRAM as safe."""
+    if not 0 < memory_utilization <= 1:
+        raise ValueError("KV-cache memory utilization must be in (0, 1]")
+    if safety_memory < 0:
+        raise ValueError("KV-cache safety memory cannot be negative")
+    if not 0 < free_memory <= total_memory:
+        raise ValueError("CUDA memory information is invalid")
+
+    currently_used = total_memory - free_memory
+    budget_to_utilization_target = (
+        int(total_memory * memory_utilization) - currently_used
+    )
+    budget_after_safety_margin = free_memory - safety_memory
+    budget = min(budget_to_utilization_target, budget_after_safety_margin)
+    if budget <= 0:
+        raise RuntimeError(
+            "No VRAM remains for the KV cache after the utilization target and "
+            "safety margin"
+        )
+    return budget
 
 
 def _resolve_execution_dtype(execution_dtype, device):
@@ -93,6 +124,8 @@ def build_scheduler(
     prefill_chunk_size=16,
     max_batch_size=None,
     kv_cache_memory_mb=None,
+    kv_cache_memory_utilization=DEFAULT_CUDA_KV_MEMORY_UTILIZATION,
+    kv_cache_safety_mb=DEFAULT_CUDA_KV_SAFETY_MB,
     execution_dtype="float32",
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -108,12 +141,35 @@ def build_scheduler(
         max_batch_size = 32 if device.type == "cuda" else 4
     if max_batch_size <= 0:
         raise ValueError("max_batch_size must be positive")
-    if kv_cache_memory_mb is None:
+    memory_budget_source = "model_default"
+    cuda_memory_snapshot = None
+    if (
+        kv_cache_memory_mb is None
+        and device.type == "cuda"
+        and model_name in (DISTILGPT2_MODEL, GPT2_MODEL)
+    ):
+        torch.cuda.synchronize(device)
+        free_memory, total_memory = torch.cuda.mem_get_info(device)
+        kv_cache_memory = calculate_cuda_kv_cache_budget(
+            free_memory=free_memory,
+            total_memory=total_memory,
+            memory_utilization=kv_cache_memory_utilization,
+            safety_memory=kv_cache_safety_mb * MIB,
+        )
+        memory_budget_source = "cuda_auto"
+        cuda_memory_snapshot = {
+            "free_bytes_before_kv": free_memory,
+            "total_bytes": total_memory,
+            "target_utilization": kv_cache_memory_utilization,
+            "safety_bytes": kv_cache_safety_mb * MIB,
+        }
+    elif kv_cache_memory_mb is None:
         kv_cache_memory = default_kv_cache_memory
     else:
         if kv_cache_memory_mb <= 0:
             raise ValueError("kv_cache_memory_mb must be positive")
-        kv_cache_memory = kv_cache_memory_mb * 1024 * 1024
+        kv_cache_memory = kv_cache_memory_mb * MIB
+        memory_budget_source = "explicit"
 
     kv_manager = KVCacheManager(
         block_size=16,
@@ -123,6 +179,12 @@ def build_scheduler(
         num_layers=config.num_layers,
         num_kv_heads=config.num_heads,
         head_dim=config.head_dim,
+    )
+    kv_manager.memory_budget_source = memory_budget_source
+    kv_manager.cuda_memory_snapshot = cuda_memory_snapshot
+    kv_manager.model_parameter_bytes = sum(
+        parameter.numel() * parameter.element_size()
+        for parameter in model.parameters()
     )
     paged_attention = PagedAttention(
         kv_manager=kv_manager,
@@ -166,7 +228,19 @@ def main():
     parser.add_argument(
         "--kv-cache-memory-mb",
         type=int,
-        help="KV-cache memory budget in MiB",
+        help="explicit KV-cache budget in MiB; CUDA GPT models default to auto",
+    )
+    parser.add_argument(
+        "--kv-cache-memory-utilization",
+        type=float,
+        default=DEFAULT_CUDA_KV_MEMORY_UTILIZATION,
+        help="target total GPU memory utilization for automatic KV sizing",
+    )
+    parser.add_argument(
+        "--kv-cache-safety-mb",
+        type=int,
+        default=DEFAULT_CUDA_KV_SAFETY_MB,
+        help="VRAM retained for activations and temporary attention buffers",
     )
     parser.add_argument(
         "--dtype",
@@ -182,6 +256,8 @@ def main():
         prefill_chunk_size=args.prefill_chunk_size,
         max_batch_size=args.max_batch_size,
         kv_cache_memory_mb=args.kv_cache_memory_mb,
+        kv_cache_memory_utilization=args.kv_cache_memory_utilization,
+        kv_cache_safety_mb=args.kv_cache_safety_mb,
         execution_dtype=args.dtype,
     )
     first_request = scheduler.add_request("Paged attention", max_new_tokens=8)

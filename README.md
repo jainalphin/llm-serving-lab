@@ -48,6 +48,13 @@ GPT-2:
 PYTHONPATH=. python main.py --model gpt2
 ```
 
+On CUDA, GPT-2 and DistilGPT-2 automatically size the paged KV cache after model
+loading. The default targets 90% total device utilization while retaining 3 GiB
+for activations and temporary attention buffers. An explicit
+`--kv-cache-memory-mb` overrides automatic sizing. The startup benchmark reports
+model bytes, KV bytes, token capacity, and maximum-length request capacity; free
+VRAM is never assumed to be safely usable in full.
+
 DistilGPT-2:
 
 ```bash
@@ -162,13 +169,15 @@ The quick profile tests 128-token and 900-token prompts. The extreme profile tes
 all-at-once burst. GPT-2 has a 1,024-token context limit, so the 900-input/64-output
 case is close to its architectural maximum without exceeding it.
 
-vLLM recommends a compatible fresh environment because its wheel bundles compiled
-CUDA/PyTorch components. On a new Kaggle GPU session, install it first and restart
-the kernel afterward:
+vLLM recommends a compatible environment because its wheel bundles compiled
+CUDA/PyTorch components. Install it into the notebook kernel's exact interpreter:
 
 ```python
+import sys
+
 %pip install -q uv
-!uv pip install --system vllm --torch-backend=auto
+!uv pip install --python {sys.executable} vllm --torch-backend=auto
+!{sys.executable} -c "import vllm; print(vllm.__version__)"
 ```
 
 Then clone this repository and run the correctness gate before benchmarking:
@@ -183,7 +192,7 @@ trace, decoding settings, metrics, and telemetry format as the other engines:
 ```bash
 PYTHONPATH=. python comparison_benchmark.py \
   --engine vllm \
-  --dtype float32 \
+  --dtype float16 \
   --input-length 128 \
   --output-length 32 \
   --num-requests 30 \
@@ -202,27 +211,67 @@ caching and uses greedy decoding with EOS ignored to generate exactly the reques
 number of tokens. Do not add `--vllm-enforce-eager` for the measured run unless
 CUDA graph initialization fails; eager and graph results are different tracks.
 
-Start with the FP32 quick matrix:
+Start with the FP16 quick matrix on NVIDIA GPUs:
 
 ```bash
 PYTHONPATH=. python run_comparison_matrix.py \
   --profile quick \
-  --dtype float32
+  --dtype float16
 ```
 
-After it completes successfully, run the longer FP32 extreme matrix. Run FP16 as a
-separate track rather than combining its results with FP32:
+FP32 is an optional numerical control and must remain a separate track rather than
+being combined with FP16 results.
+
+## Two-GPU capacity
+
+Two T4s do not provide one unified memory pool. For GPT-2 throughput, use one
+independent replica per GPU and split incoming requests evenly. The following
+commands run both replicas concurrently and report aggregate RPS plus per-GPU
+utilization. Do not set `CUDA_VISIBLE_DEVICES=0` around these commands.
+
+Short-context PagedServe capacity around the 50–60 RPS target:
 
 ```bash
-PYTHONPATH=. python run_comparison_matrix.py \
-  --profile extreme \
-  --dtype float32
-
-PYTHONPATH=. python run_comparison_matrix.py \
-  --profile extreme \
+PYTHONPATH=. python dual_gpu_capacity_benchmark.py \
+  --engine pagedserve \
+  --pagedserve-strategy orca \
   --dtype float16 \
-  --output-dir benchmarks/comparison-fp16
+  --input-length 128 \
+  --output-length 32 \
+  --max-batch-size 128 \
+  --request-rate 20 \
+  --request-rate 30 \
+  --request-rate 40 \
+  --request-rate 50 \
+  --request-rate 60 \
+  --request-rate 70 \
+  --request-rate 80
 ```
+
+Run the identical curve for vLLM:
+
+```bash
+PYTHONPATH=. python dual_gpu_capacity_benchmark.py \
+  --engine vllm \
+  --dtype float16 \
+  --input-length 128 \
+  --output-length 32 \
+  --max-batch-size 128 \
+  --request-rate 20 \
+  --request-rate 30 \
+  --request-rate 40 \
+  --request-rate 50 \
+  --request-rate 60 \
+  --request-rate 70 \
+  --request-rate 80 \
+  --output-dir /tmp/vllm-dual-capacity
+```
+
+Repeat with `--input-length 900 --output-length 64` for near-maximum GPT-2
+context. Add your actual `--ttft-slo-ms`, `--tpot-slo-ms`, and `--e2e-slo-ms`
+requirements to measure SLO-qualified goodput. Memory capacity and sustainable RPS
+are different: adding KV pages prevents admission failures but cannot increase the
+T4's compute throughput.
 
 The matrix writes temporary raw results and logs under `benchmarks/comparison/`,
 which Git ignores. Copy only verified environment details and summary tables into

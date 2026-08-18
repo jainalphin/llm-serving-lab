@@ -72,6 +72,19 @@ def test_common_request_metrics_and_goodput():
     assert math.isclose(summary["goodput_requests_per_second"], 1 / 1.1)
     assert summary["generated_tokens"] == 6
 
+    no_slo_summary = summarize_scenario(
+        engine="test",
+        request_rate=2.0,
+        records=records,
+        duration=1.1,
+        output_length=3,
+        telemetry=None,
+        ttft_slo_ms=None,
+        tpot_slo_ms=None,
+        e2e_slo_ms=None,
+    )
+    assert no_slo_summary["goodput_requests_per_second"] is None
+
 
 def test_vllm_delta_stream_records_each_generated_token_once():
     class FakeVLLMEngine:
